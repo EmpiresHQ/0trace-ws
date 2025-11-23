@@ -399,64 +399,83 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<H
             eprintln!("[DEBUG poll_icmp_socket] ICMP from router: {}", router_ip);
             
             // Parse MPLS extensions (RFC 4884, RFC 4950)
-            // ICMP extensions start after the original datagram (if length >= 128 bytes)
+            // Extensions are after the original datagram in the ICMP payload
+            // Format: ICMP header (8) + original IP header (20+) + original data (variable)
+            // Extensions start at 128 bytes from ICMP start if present
             let mut mpls_labels = Vec::new();
-            let icmp_length = buf[icmp_start + 2];
-            if icmp_length >= 128 {
-                // Extensions present
-                let ext_offset = icmp_start + 8 + 128; // ICMP header + 128 bytes
-                if bytes_read >= ext_offset + 4 {
-                    // Extension header: version (4 bits) + reserved (12 bits) + checksum (16 bits)
-                    let ext_version = (buf[ext_offset] >> 4) & 0x0F;
-                    if ext_version == 2 {
-                        eprintln!("[DEBUG poll_icmp_socket] ICMP extensions present (version 2)");
+            
+            // RFC 4884: Extensions are present if there's data after byte 128 of ICMP message
+            // and the original IP header length field indicates <= 20 bytes
+            let orig_ip_ihl = (buf[orig_ip_offset] & 0x0F) * 4;
+            eprintln!("[DEBUG poll_icmp_socket] Original IP IHL: {} bytes", orig_ip_ihl);
+            
+            // Extension header starts at ICMP + 128 bytes
+            let ext_start = icmp_start + 128;
+            
+            if bytes_read > ext_start + 4 {
+                // Check for extension header
+                let ext_version = (buf[ext_start] >> 4) & 0x0F;
+                let ext_checksum = u16::from_be_bytes([buf[ext_start + 2], buf[ext_start + 3]]);
+                
+                eprintln!("[DEBUG poll_icmp_socket] Extension header at offset {}: version={}, checksum=0x{:04x}", 
+                    ext_start, ext_version, ext_checksum);
+                
+                if ext_version == 2 {
+                    eprintln!("[DEBUG poll_icmp_socket] ICMP extensions present (version 2)");
+                    
+                    let mut obj_offset = ext_start + 4;
+                    while obj_offset + 4 <= bytes_read {
+                        let obj_len = u16::from_be_bytes([buf[obj_offset], buf[obj_offset + 1]]) as usize;
+                        let class_num = buf[obj_offset + 2];
+                        let c_type = buf[obj_offset + 3];
                         
-                        let mut obj_offset = ext_offset + 4;
-                        while obj_offset + 4 <= bytes_read {
-                            let obj_len = u16::from_be_bytes([buf[obj_offset], buf[obj_offset + 1]]) as usize;
-                            let class_num = buf[obj_offset + 2];
-                            let c_type = buf[obj_offset + 3];
+                        eprintln!("[DEBUG poll_icmp_socket] Extension object: len={}, class={}, type={}", 
+                            obj_len, class_num, c_type);
+                        
+                        if obj_len < 4 || obj_offset + obj_len > bytes_read {
+                            break;
+                        }
+                        
+                        // Class 1 = MPLS Stack Entry
+                        if class_num == 1 && c_type == 1 {
+                            eprintln!("[DEBUG poll_icmp_socket] MPLS Stack Entry found");
+                            let mut label_offset = obj_offset + 4;
                             
-                            if obj_len < 4 || obj_offset + obj_len > bytes_read {
-                                break;
-                            }
-                            
-                            // Class 1 = MPLS Stack Entry
-                            if class_num == 1 && c_type == 1 {
-                                eprintln!("[DEBUG poll_icmp_socket] MPLS Stack Entry found");
-                                let mut label_offset = obj_offset + 4;
+                            while label_offset + 4 <= obj_offset + obj_len {
+                                let label_word = u32::from_be_bytes([
+                                    buf[label_offset],
+                                    buf[label_offset + 1],
+                                    buf[label_offset + 2],
+                                    buf[label_offset + 3]
+                                ]);
                                 
-                                while label_offset + 4 <= obj_offset + obj_len {
-                                    let label_word = u32::from_be_bytes([
-                                        buf[label_offset],
-                                        buf[label_offset + 1],
-                                        buf[label_offset + 2],
-                                        buf[label_offset + 3]
-                                    ]);
-                                    
-                                    let label = (label_word >> 12) & 0xFFFFF;
-                                    let exp = ((label_word >> 9) & 0x7) as u8;
-                                    let s = (label_word >> 8) & 0x1;
-                                    let ttl = (label_word & 0xFF) as u8;
-                                    
-                                    eprintln!("[DEBUG poll_icmp_socket] MPLS Label: {}, EXP: {}, S: {}, TTL: {}", 
-                                        label, exp, s, ttl);
-                                    
-                                    mpls_labels.push(MplsLabel { label, exp, ttl });
-                                    
-                                    label_offset += 4;
-                                    
-                                    if s == 1 {
-                                        // Bottom of stack
-                                        break;
-                                    }
+                                let label = (label_word >> 12) & 0xFFFFF;
+                                let exp = ((label_word >> 9) & 0x7) as u8;
+                                let s = (label_word >> 8) & 0x1;
+                                let ttl = (label_word & 0xFF) as u8;
+                                
+                                eprintln!("[DEBUG poll_icmp_socket] MPLS Label: {}, EXP: {}, S: {}, TTL: {}", 
+                                    label, exp, s, ttl);
+                                
+                                mpls_labels.push(MplsLabel { label, exp, ttl });
+                                
+                                label_offset += 4;
+                                
+                                if s == 1 {
+                                    // Bottom of stack
+                                    break;
                                 }
                             }
-                            
-                            obj_offset += obj_len;
                         }
+                        
+                        obj_offset += obj_len;
                     }
+                } else {
+                    eprintln!("[DEBUG poll_icmp_socket] No ICMP extensions (version={}, expected 2)", ext_version);
                 }
+            } else {
+                eprintln!("[DEBUG poll_icmp_socket] Packet too small for extensions (size={}, need > {})", 
+                    bytes_read, ext_start + 4);
             }
             
             // Check if this ICMP is in response to our probe
