@@ -34,11 +34,35 @@ pub async fn handle_client(
     ttl_timeout: Duration,
 ) {
     let peer_id = format!("{}", peer);
+    
+    // Will store real client IP from headers
+    let real_client_ip = std::sync::Arc::new(std::sync::Mutex::new(None::<Ipv4Addr>));
+    let real_client_ip_clone = real_client_ip.clone();
 
     // Do WebSocket handshake
-    let cb = |_req: &Request,
+    let cb = move |req: &Request,
               mut resp: Response|
      -> Result<Response, ErrorResponse> {
+        // Try to get real IP from proxy headers
+        if let Some(forwarded) = req.headers().get("X-Forwarded-For") {
+            if let Ok(forwarded_str) = forwarded.to_str() {
+                // X-Forwarded-For can be "client, proxy1, proxy2"
+                if let Some(client_ip) = forwarded_str.split(',').next() {
+                    if let Ok(ip) = client_ip.trim().parse::<Ipv4Addr>() {
+                        eprintln!("[DEBUG handler] Real client IP from X-Forwarded-For: {}", ip);
+                        *real_client_ip_clone.lock().unwrap() = Some(ip);
+                    }
+                }
+            }
+        } else if let Some(real_ip) = req.headers().get("X-Real-IP") {
+            if let Ok(ip_str) = real_ip.to_str() {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    eprintln!("[DEBUG handler] Real client IP from X-Real-IP: {}", ip);
+                    *real_client_ip_clone.lock().unwrap() = Some(ip);
+                }
+            }
+        }
+        
         resp.headers_mut()
             .insert("X-ZeroTrace", "ok".parse().unwrap());
         Ok(resp)
@@ -76,17 +100,33 @@ pub async fn handle_client(
         let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
         let local_port = u16::from_be(local_in.sin_port);
         
-        // Get client's IP (after NAT)
-        let remote_ip = match peer.ip() {
-            std::net::IpAddr::V4(ip) => ip,
-            _ => {
-                eprintln!("[DEBUG handler] IPv6 not supported");
-                return;
+        // Use real client IP from headers if available, otherwise fall back to peer
+        let remote_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
+            eprintln!("[DEBUG handler] Using real client IP from headers: {}", real_ip);
+            real_ip
+        } else {
+            match peer.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    eprintln!("[DEBUG handler] Using peer IP: {}", ip);
+                    ip
+                },
+                _ => {
+                    eprintln!("[DEBUG handler] IPv6 not supported");
+                    return;
+                }
             }
         };
         let remote_port = peer.port();
         
-        ((local_ip, local_port), (remote_ip, remote_port))
+        // FOR TESTING: If client is on local network, trace to 8.8.8.8 instead
+        let (target_ip, target_port) = if remote_ip.is_private() || remote_ip.is_loopback() {
+            eprintln!("[DEBUG handler] Client {} is local, tracing to 8.8.8.8 for testing", remote_ip);
+            (Ipv4Addr::new(8, 8, 8, 8), 53)
+        } else {
+            (remote_ip, remote_port)
+        };
+        
+        ((local_ip, local_port), (target_ip, target_port))
     };
     
     eprintln!("[DEBUG handler] Tracing path: Server {}:{} -> Client {}:{}", 
