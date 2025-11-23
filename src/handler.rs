@@ -85,57 +85,68 @@ pub async fn handle_client(
     );
 
     // Extract connection details from the established TCP socket
-    // We need: local IP:port and remote IP:port to craft realistic TCP packets
     let tcp = ws.get_ref();
     let tcp_fd = tcp.as_raw_fd();
     
-    // Get local (server) address and remote (client) address for traceroute
-    // IMPORTANT: We need the REAL public IPs, not Docker internal IPs
-    let (local_addr, remote_addr) = {
-        // Don't use getsockname - it gives us Docker internal IP!
-        // Instead, we'll use a hardcoded or env var for server's public IP
+    // Get the actual WebSocket connection parameters
+    let (ws_local_addr, ws_peer_addr) = unsafe {
+        let mut local: libc::sockaddr_storage = std::mem::zeroed();
+        let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
         
-        // Try to get server's public IP from environment or use a default
-        let server_public_ip = std::env::var("SERVER_PUBLIC_IP")
-            .ok()
-            .and_then(|s| s.parse::<Ipv4Addr>().ok())
-            .unwrap_or_else(|| {
-                // Fallback: try to detect it (in production, set SERVER_PUBLIC_IP env var!)
-                eprintln!("[DEBUG handler] WARNING: SERVER_PUBLIC_IP not set, using 0.0.0.0 as placeholder");
-                Ipv4Addr::new(0, 0, 0, 0)
-            });
+        let mut peer: libc::sockaddr_storage = std::mem::zeroed();
+        let mut peer_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        libc::getpeername(tcp_fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut peer_len);
         
-        eprintln!("[DEBUG handler] Server public IP: {}", server_public_ip);
+        let local_in = &*((&local) as *const _ as *const libc::sockaddr_in);
+        let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
+        let local_port = u16::from_be(local_in.sin_port);
         
-        // For source port, we can use any ephemeral port
-        let local_port = 12345u16;
+        let peer_in = &*((&peer) as *const _ as *const libc::sockaddr_in);
+        let peer_ip = Ipv4Addr::from(u32::from_be(peer_in.sin_addr.s_addr));
+        let peer_port = u16::from_be(peer_in.sin_port);
         
-        // ALWAYS use real client IP from headers (required behind proxy like Traefik)
-        let remote_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
-            eprintln!("[DEBUG handler] Using real client IP from headers: {}", real_ip);
-            real_ip
-        } else {
-            eprintln!("[DEBUG handler] No X-Forwarded-For or X-Real-IP header found!");
-            match peer.ip() {
-                std::net::IpAddr::V4(ip) => {
-                    eprintln!("[DEBUG handler] Falling back to peer IP: {} (WARNING: this is likely the proxy!)", ip);
-                    ip
-                },
-                _ => {
-                    eprintln!("[DEBUG handler] IPv6 not supported");
-                    return;
-                }
-            }
-        };
-        
-        // For destination port, use common port (doesn't really matter for traceroute)
-        let remote_port = 443;
-        
-        ((server_public_ip, local_port), (remote_ip, remote_port))
+        ((local_ip, local_port), (peer_ip, peer_port))
     };
     
-    eprintln!("[DEBUG handler] Tracing path: Server {}:{} -> Client {}:{}", 
-        local_addr.0, local_addr.1, remote_addr.0, remote_addr.1);
+    eprintln!("[DEBUG handler] WebSocket connection: {}:{} <-> {}:{}", 
+        ws_local_addr.0, ws_local_addr.1, ws_peer_addr.0, ws_peer_addr.1);
+    
+    // Get server's public IP for crafting packets
+    let server_public_ip = std::env::var("SERVER_PUBLIC_IP")
+        .ok()
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .unwrap_or_else(|| {
+            eprintln!("[DEBUG handler] SERVER_PUBLIC_IP not set, using WebSocket local IP");
+            ws_local_addr.0
+        });
+    
+    eprintln!("[DEBUG handler] Using source IP: {}", server_public_ip);
+    
+    // Get REAL client IP from headers (required behind proxy like Traefik)
+    let real_client_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
+        eprintln!("[DEBUG handler] Real client IP from headers: {}", real_ip);
+        real_ip
+    } else {
+        eprintln!("[DEBUG handler] No X-Forwarded-For or X-Real-IP header found!");
+        match peer.ip() {
+            std::net::IpAddr::V4(ip) => {
+                eprintln!("[DEBUG handler] WARNING: Using peer IP {} (likely proxy!)", ip);
+                ip
+            },
+            _ => {
+                eprintln!("[DEBUG handler] IPv6 not supported");
+                return;
+            }
+        }
+    };
+    
+    // For 0trace: mimic existing connection but with real client IP as destination
+    // Use server's public IP as source, arbitrary port (since we craft the whole packet)
+    let trace_params = (server_public_ip, 54321u16, real_client_ip, 443u16);
+    
+    eprintln!("[DEBUG handler] Trace packets: {}:{} -> {}:{}", 
+        trace_params.0, trace_params.1, trace_params.2, trace_params.3);
 
     // Create a raw IP socket for sending custom TCP packets with specific TTL
     // This is the key to 0trace: we send packets that mimic the real connection
@@ -155,7 +166,7 @@ pub async fn handle_client(
     // Unlike MSG_ERRQUEUE approach, we create a separate socket that receives
     // ALL ICMP packets, then filter for Time Exceeded messages matching our IP IDs
     // This is similar to how the Go implementation uses pcap to capture ICMP
-    let icmp_fd = match create_icmp_socket(Some(local_addr.0)) {
+    let icmp_fd = match create_icmp_socket(Some(ws_local_addr.0)) {
         Ok(fd) => fd,
         Err(e) => {
             event_bus().emit(
@@ -201,10 +212,10 @@ pub async fn handle_client(
             
             match send_tcp_probe(
                 raw_fd,
-                local_addr.0,   // src_ip (our server)
-                remote_addr.0,  // dst_ip (client)
-                local_addr.1,   // src_port
-                remote_addr.1,  // dst_port
+                trace_params.0,   // src_ip (our server)
+                trace_params.2,   // dst_ip (real client)
+                trace_params.1,   // src_port
+                trace_params.3,   // dst_port
                 seq,
                 ttl,
             ) {
