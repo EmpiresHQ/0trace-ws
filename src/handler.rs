@@ -225,25 +225,37 @@ pub async fn handle_client(
             // The ICMP socket receives all ICMP packets; we filter by IP ID
             // to match responses to our specific probe packet
             match timeout(ttl_timeout, async move { poll_icmp_socket(icmp_fd, ip_id).await }).await {
-                Ok(Ok(Some(router))) => {
+                Ok(Ok(Some(hop_info))) => {
                     let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms", router, rtt_ms);
+                    eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms, MPLS labels: {}", 
+                        hop_info.router_ip, rtt_ms, hop_info.mpls_labels.len());
+                    
                     let hop = Hop {
                         client_id: peer_id_clone.clone(),
                         ttl,
-                        router: router.clone(),
+                        router: hop_info.router_ip.clone(),
                         rtt_ms,
                     };
                     let payload = serde_json::to_value(&hop).unwrap();
                     event_bus().emit("hop", &payload);
-                    // Send hop to client with type field
+                    
+                    // Send hop to client with type field and MPLS labels
+                    let mpls_json: Vec<serde_json::Value> = hop_info.mpls_labels.iter().map(|l| {
+                        serde_json::json!({
+                            "label": l.label,
+                            "exp": l.exp,
+                            "ttl": l.ttl
+                        })
+                    }).collect();
+                    
                     let hop_msg = serde_json::json!({
                         "type": "hop",
                         "clientId": peer_id_clone.clone(),
                         "ttl": ttl,
-                        "ip": router.clone(),
-                        "router": router.clone(),
-                        "rtt_ms": rtt_ms
+                        "ip": hop_info.router_ip,
+                        "router": hop_info.router_ip,
+                        "rtt_ms": rtt_ms,
+                        "mpls": mpls_json
                     });
                     let _ = ws_writer
                         .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))

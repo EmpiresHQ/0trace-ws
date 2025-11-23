@@ -11,6 +11,21 @@ use libc::{
 const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_EXC_TTL: u8 = 0;
 
+/// MPLS label stack entry
+#[derive(Debug, Clone)]
+pub struct MplsLabel {
+    pub label: u32,
+    pub exp: u8,
+    pub ttl: u8,
+}
+
+/// Hop information including router IP and optional MPLS labels
+#[derive(Debug, Clone)]
+pub struct HopInfo {
+    pub router_ip: String,
+    pub mpls_labels: Vec<MplsLabel>,
+}
+
 /// Create a raw IP socket for sending custom TCP packets
 /// 
 /// This socket allows us to craft complete IP packets with custom headers,
@@ -230,8 +245,8 @@ pub fn send_tcp_probe(
 /// This approach is similar to the Go implementation which uses pcap - we
 /// capture ICMP packets and match them by IP ID in the embedded original packet.
 /// 
-/// Returns the router IP if a matching ICMP Time Exceeded is found, None if timeout.
-pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<String>> {
+/// Returns the router info with MPLS labels if a matching ICMP Time Exceeded is found, None if timeout.
+pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<HopInfo>> {
     // Receive ICMP packets using recvfrom. This is a blocking syscall;
     // call it inside spawn_blocking so we don't block the Tokio reactor.
     let res = tokio::task::spawn_blocking(move || {
@@ -383,10 +398,74 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             );
             eprintln!("[DEBUG poll_icmp_socket] ICMP from router: {}", router_ip);
             
+            // Parse MPLS extensions (RFC 4884, RFC 4950)
+            // ICMP extensions start after the original datagram (if length >= 128 bytes)
+            let mut mpls_labels = Vec::new();
+            let icmp_length = buf[icmp_start + 2];
+            if icmp_length >= 128 {
+                // Extensions present
+                let ext_offset = icmp_start + 8 + 128; // ICMP header + 128 bytes
+                if bytes_read >= ext_offset + 4 {
+                    // Extension header: version (4 bits) + reserved (12 bits) + checksum (16 bits)
+                    let ext_version = (buf[ext_offset] >> 4) & 0x0F;
+                    if ext_version == 2 {
+                        eprintln!("[DEBUG poll_icmp_socket] ICMP extensions present (version 2)");
+                        
+                        let mut obj_offset = ext_offset + 4;
+                        while obj_offset + 4 <= bytes_read {
+                            let obj_len = u16::from_be_bytes([buf[obj_offset], buf[obj_offset + 1]]) as usize;
+                            let class_num = buf[obj_offset + 2];
+                            let c_type = buf[obj_offset + 3];
+                            
+                            if obj_len < 4 || obj_offset + obj_len > bytes_read {
+                                break;
+                            }
+                            
+                            // Class 1 = MPLS Stack Entry
+                            if class_num == 1 && c_type == 1 {
+                                eprintln!("[DEBUG poll_icmp_socket] MPLS Stack Entry found");
+                                let mut label_offset = obj_offset + 4;
+                                
+                                while label_offset + 4 <= obj_offset + obj_len {
+                                    let label_word = u32::from_be_bytes([
+                                        buf[label_offset],
+                                        buf[label_offset + 1],
+                                        buf[label_offset + 2],
+                                        buf[label_offset + 3]
+                                    ]);
+                                    
+                                    let label = (label_word >> 12) & 0xFFFFF;
+                                    let exp = ((label_word >> 9) & 0x7) as u8;
+                                    let s = (label_word >> 8) & 0x1;
+                                    let ttl = (label_word & 0xFF) as u8;
+                                    
+                                    eprintln!("[DEBUG poll_icmp_socket] MPLS Label: {}, EXP: {}, S: {}, TTL: {}", 
+                                        label, exp, s, ttl);
+                                    
+                                    mpls_labels.push(MplsLabel { label, exp, ttl });
+                                    
+                                    label_offset += 4;
+                                    
+                                    if s == 1 {
+                                        // Bottom of stack
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            obj_offset += obj_len;
+                        }
+                    }
+                }
+            }
+            
             // Check if this ICMP is in response to our probe
             if orig_ip_id == expected_ip_id {
                 eprintln!("[DEBUG poll_icmp_socket] Match! Router IP: {}", router_ip);
-                return Ok(Some(router_ip.to_string()));
+                return Ok(Some(HopInfo {
+                    router_ip: router_ip.to_string(),
+                    mpls_labels,
+                }));
             } else {
                 eprintln!("[DEBUG poll_icmp_socket] IP ID mismatch, continuing to listen...");
             }

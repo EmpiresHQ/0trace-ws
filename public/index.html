@@ -457,6 +457,14 @@
                             <span class="detail-value">${hop.hostname}</span>
                         </div>
                         ` : ''}
+                        ${hop.mpls && hop.mpls.length > 0 ? `
+                        <div class="hop-detail" style="grid-column: 1 / -1;">
+                            <span class="detail-label">MPLS Stack:</span>
+                            <span class="detail-value" style="font-family: monospace; color: #28a745;">
+                                ${hop.mpls.map(m => `Label=${m.label} EXP=${m.exp} TTL=${m.ttl}`).join(' | ')}
+                            </span>
+                        </div>
+                        ` : ''}
                     </div>
                 </div>
             `).join('');
