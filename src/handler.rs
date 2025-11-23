@@ -65,9 +65,8 @@ pub async fn handle_client(
     let tcp = ws.get_ref();
     let tcp_fd = tcp.as_raw_fd();
     
-    // Get local and remote addresses for the TCP connection
-    // These will be used to craft probe packets that look like they're part
-    // of the real connection (same src/dst IP:port)
+    // Get local (server) address and remote (client after NAT) address
+    // We'll trace the path FROM our server TO the client
     let (local_addr, remote_addr) = unsafe {
         let mut local: libc::sockaddr_storage = std::mem::zeroed();
         let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
@@ -77,23 +76,20 @@ pub async fn handle_client(
         let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
         let local_port = u16::from_be(local_in.sin_port);
         
-        let _remote_ip = match peer.ip() {
+        // Get client's IP (after NAT)
+        let remote_ip = match peer.ip() {
             std::net::IpAddr::V4(ip) => ip,
             _ => {
                 eprintln!("[DEBUG handler] IPv6 not supported");
                 return;
             }
         };
+        let remote_port = peer.port();
         
-        // For now, hardcode target to 8.8.8.8:80 (Google DNS) for testing
-        // TODO: Accept target from WebSocket message
-        let target_ip = Ipv4Addr::new(8, 8, 8, 8);
-        let target_port = 80;
-        
-        ((local_ip, local_port), (target_ip, target_port))
+        ((local_ip, local_port), (remote_ip, remote_port))
     };
     
-    eprintln!("[DEBUG handler] Connection: {}:{} -> {}:{}", 
+    eprintln!("[DEBUG handler] Tracing path: Server {}:{} -> Client {}:{}", 
         local_addr.0, local_addr.1, remote_addr.0, remote_addr.1);
 
     // Create a raw IP socket for sending custom TCP packets with specific TTL
@@ -129,6 +125,11 @@ pub async fn handle_client(
     // Split WebSocket so we can send/receive
     let (mut ws_writer, mut ws_reader) = ws.split();
 
+    // Send greeting
+    let _ = ws_writer
+        .send(Message::Text(r#"{"type":"connected","message":"Trace started automatically"}"#.into()))
+        .await;
+
     // Tracing task
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let peer_id_clone = peer_id.clone();
@@ -141,11 +142,6 @@ pub async fn handle_client(
         .as_secs() & 0xFFFFFFFF) as u32;
 
     let trace_task = tokio::spawn(async move {
-        // Send a greeting
-        let _ = ws_writer
-            .send(Message::Text(r#"{"type":"connected","message":"zerotrace connected"}"#.into()))
-            .await;
-
         // Traceroute: increment TTL from 1 to max_hops
         // Each iteration sends a probe packet and waits for ICMP response
         for ttl in 1..=max_hops {
@@ -165,10 +161,10 @@ pub async fn handle_client(
             // - Unique IP ID for packet identification
             let ip_id = match send_tcp_probe(
                 raw_fd,
-                local_addr.0,
-                remote_addr.0,
-                local_addr.1,
-                remote_addr.1,
+                local_addr.0,   // src_ip (our server)
+                remote_addr.0,  // dst_ip (client)
+                local_addr.1,   // src_port
+                remote_addr.1,  // dst_port
                 seq,
                 ttl,
             ) {

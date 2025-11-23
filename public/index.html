@@ -341,9 +341,12 @@
                         style="min-width: 250px;"
                     >
                 </div>
-                <button id="connectBtn" class="btn-connect">Connect</button>
+                <button id="connectBtn" class="btn-connect">Start Trace</button>
                 <button id="disconnectBtn" class="btn-disconnect" disabled>Disconnect</button>
                 <button id="clearBtn" class="btn-clear">Clear Hops</button>
+            </div>
+            <div style="padding: 10px 0; color: #6c757d; font-size: 0.9em;">
+                💡 Automatically traces the path from server to your client
             </div>
         </div>
 
@@ -473,8 +476,8 @@
 
                 ws.onopen = () => {
                     updateStatus(true);
-                    showMessage('Connected to WebSocket server', 'success');
-                    console.log('WebSocket connected');
+                    showMessage('Connected - trace started automatically', 'success');
+                    console.log('WebSocket connected, trace started');
                 };
 
                 ws.onmessage = (event) => {
