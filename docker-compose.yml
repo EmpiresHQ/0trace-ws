@@ -31,6 +31,10 @@ services:
     cap_add:
       - NET_RAW
       - NET_ADMIN
+    # Disable reverse path filtering to allow spoofed source IPs (required for 0trace)
+    sysctls:
+      - net.ipv4.conf.all.rp_filter=0
+      - net.ipv4.conf.default.rp_filter=0
     logging:
       driver: "json-file"
       options:
