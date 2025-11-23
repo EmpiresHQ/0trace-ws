@@ -1,12 +1,12 @@
 use crate::events::event_bus;
-use crate::socket::{create_raw_socket, create_icmp_socket, poll_icmp_socket, send_tcp_probe};
+use crate::socket::{create_raw_socket, create_icmp_socket, poll_icmp_any, send_tcp_probe};
 use crate::types::Hop;
 use futures::{SinkExt, StreamExt};
 use std::net::{SocketAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{Request, Response, ErrorResponse},
@@ -214,33 +214,29 @@ pub async fn handle_client(
         
         eprintln!("[DEBUG handler] === All {} probes sent, collecting ICMP responses ===", probe_map.len());
         
-        // STEP 2: Collect ICMP responses for all probes
-        // We listen for ICMP Time Exceeded messages and match them by IP ID
+        // STEP 2: Collect ICMP responses for all probes (true 0trace approach)
+        // We read ICMP packets and check if they match ANY of our expected IP IDs
         let collection_deadline = tokio::time::Instant::now() + ttl_timeout * 3;
         let total_probes = probe_map.len();
         
-        // We need to poll for ANY ICMP response, not specific IP IDs
-        // Use a loop that receives any ICMP packet and checks if it matches any of our probes
-        let mut attempts = 0;
-        const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
-        
-        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline && attempts < MAX_ATTEMPTS {
-            attempts += 1;
+        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline {
+            // Build set of all IP IDs we're still waiting for
+            let expected_ids: std::collections::HashSet<u16> = probe_map.keys().copied().collect();
             
-            // Receive ANY ICMP packet with a short timeout
-            // We'll use poll_icmp_socket in a special way - try each IP ID we're waiting for
-            // But actually we need to modify poll_icmp_socket to accept ANY matching packet
+            let remaining_time_ms = collection_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(500) as u64; // Check every 500ms max
             
-            // For now, iterate through all pending IP IDs and check each one with a very short timeout
-            let mut found_any = false;
-            let check_timeout = Duration::from_millis(50);
+            if remaining_time_ms == 0 {
+                break;
+            }
             
-            for (&ip_id, &(ttl, send_at)) in probe_map.clone().iter() {
-                match timeout(check_timeout, poll_icmp_socket(icmp_fd, ip_id)).await {
-                    Ok(Ok(Some(hop_info))) => {
-                        found_any = true;
-                        probe_map.remove(&ip_id);
-                        
+            // Poll for ANY ICMP response matching our probes
+            match poll_icmp_any(icmp_fd, &expected_ids, remaining_time_ms).await {
+                Ok(Some((ip_id, hop_info))) => {
+                    // Found a response! Remove from pending and report
+                    if let Some((ttl, send_at)) = probe_map.remove(&ip_id) {
                         let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
                         eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms ({}/{} responses)", 
                             ttl, hop_info.router_ip, rtt_ms, total_probes - probe_map.len(), total_probes);
@@ -275,23 +271,15 @@ pub async fn handle_client(
                         let _ = ws_writer
                             .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
                             .await;
-                        
-                        break; // Found one, continue outer loop
-                    }
-                    Ok(Ok(None)) | Err(_) => {
-                        // No response yet for this IP ID, continue checking others
-                        continue;
-                    }
-                    Ok(Err(_e)) => {
-                        // Error for this probe, skip it
-                        continue;
                     }
                 }
-            }
-            
-            // If we didn't find any responses in this iteration, wait a bit before trying again
-            if !found_any {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(None) => {
+                    // Timeout, no ICMP received in this iteration
+                    eprintln!("[DEBUG handler] No ICMP received in this iteration, {} probes still pending", probe_map.len());
+                }
+                Err(e) => {
+                    eprintln!("[DEBUG handler] Error polling ICMP: {}", e);
+                }
             }
         }
         

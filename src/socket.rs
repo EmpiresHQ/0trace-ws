@@ -479,6 +479,138 @@ fn is_matching_icmp_time_exceeded(
     Some((src_ip, mpls_labels))
 }
 
+/// Poll the ICMP socket for Time Exceeded messages matching ANY of the expected IP IDs
+/// 
+/// This is the key function for 0trace - we receive any ICMP Time Exceeded message
+/// and check if it matches any of our probe packets.
+/// 
+/// Returns (IP ID, router IP, MPLS labels) if a matching ICMP is found, None if timeout.
+pub async fn poll_icmp_any(socket_fd: RawFd, expected_ip_ids: &std::collections::HashSet<u16>, timeout_ms: u64) -> Result<Option<(u16, HopInfo)>> {
+    let expected_set = expected_ip_ids.clone();
+    
+    let result = tokio::task::spawn_blocking(move || {
+        eprintln!("[DEBUG poll_icmp_any] Waiting for ICMP matching any of {} IP IDs", expected_set.len());
+        
+        // Set receive timeout
+        set_receive_timeout(socket_fd, (timeout_ms / 1000) as i64);
+        
+        let mut receive_buffer = [0u8; PACKET_BUFFER_SIZE];
+        let mut src_addr: sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<sockaddr_in>() as u32;
+        
+        // Try to receive ICMP packets and check if any match our expected IP IDs
+        const MAX_RECEIVE_ATTEMPTS: u32 = 50;
+        for attempt in 1..=MAX_RECEIVE_ATTEMPTS {
+            let bytes_received = unsafe {
+                recvfrom(
+                    socket_fd,
+                    receive_buffer.as_mut_ptr() as *mut c_void,
+                    receive_buffer.len(),
+                    0,
+                    &mut src_addr as *mut _ as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+            
+            if bytes_received < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut {
+                    eprintln!("[DEBUG poll_icmp_any] Timeout after {} attempts", attempt);
+                    return Ok(None);
+                }
+                eprintln!("[DEBUG poll_icmp_any] recvfrom error: {}", error);
+                return Err(error);
+            }
+            
+            let packet_size = bytes_received as usize;
+            
+            // Try to parse as ICMP Time Exceeded and check if IP ID matches any expected
+            if let Some(matched_id) = check_icmp_for_any_id(&receive_buffer, packet_size, &expected_set) {
+                eprintln!("[DEBUG poll_icmp_any] Found match for IP ID {}", matched_id);
+                
+                // Re-parse to get full hop info
+                if let Some((router_ip, mpls_labels)) = parse_icmp_time_exceeded(&receive_buffer, packet_size, matched_id) {
+                    return Ok(Some((matched_id, HopInfo {
+                        router_ip: router_ip.to_string(),
+                        mpls_labels,
+                    })));
+                }
+            }
+        }
+        
+        eprintln!("[DEBUG poll_icmp_any] No matching ICMP after {} attempts", MAX_RECEIVE_ATTEMPTS);
+        Ok(None)
+    })
+    .await?;
+
+    result.map_err(|e| anyhow!(e))
+}
+
+/// Check if an ICMP packet matches any of the expected IP IDs
+fn check_icmp_for_any_id(buffer: &[u8], packet_size: usize, expected_ids: &std::collections::HashSet<u16>) -> Option<u16> {
+    if packet_size < ETHERNET_HEADER_LEN + IP_HEADER_LEN {
+        return None;
+    }
+    
+    let ethertype = u16::from_be_bytes([buffer[12], buffer[13]]);
+    if ethertype != 0x0800 {
+        return None;
+    }
+    
+    let ip_offset = ETHERNET_HEADER_LEN;
+    let ip_protocol = buffer[ip_offset + 9];
+    
+    if ip_protocol != 1 {  // Not ICMP
+        return None;
+    }
+    
+    let ip_header_len = ((buffer[ip_offset] & 0x0F) * 4) as usize;
+    if packet_size < ip_offset + ip_header_len + ICMP_HEADER_LEN {
+        return None;
+    }
+    
+    let icmp_offset = ip_offset + ip_header_len;
+    let icmp_type = buffer[icmp_offset];
+    let icmp_code = buffer[icmp_offset + 1];
+    
+    if icmp_type != ICMP_TIME_EXCEEDED || icmp_code != ICMP_EXC_TTL {
+        return None;
+    }
+    
+    let orig_ip_offset = icmp_offset + ICMP_HEADER_LEN;
+    if packet_size < orig_ip_offset + IP_HEADER_LEN {
+        return None;
+    }
+    
+    let orig_ip_id = u16::from_be_bytes([
+        buffer[orig_ip_offset + 4],
+        buffer[orig_ip_offset + 5]
+    ]);
+    
+    if expected_ids.contains(&orig_ip_id) {
+        Some(orig_ip_id)
+    } else {
+        None
+    }
+}
+
+/// Parse ICMP Time Exceeded packet to extract router IP and MPLS labels
+fn parse_icmp_time_exceeded(buffer: &[u8], packet_size: usize, _expected_ip_id: u16) -> Option<(Ipv4Addr, Vec<MplsLabel>)> {
+    if packet_size < ETHERNET_HEADER_LEN + IP_HEADER_LEN {
+        return None;
+    }
+    
+    let ip_offset = ETHERNET_HEADER_LEN;
+    let ip_header_len = ((buffer[ip_offset] & 0x0F) * 4) as usize;
+    
+    let (router_ip, _) = extract_ip_addresses(buffer, ip_offset);
+    
+    let icmp_offset = ip_offset + ip_header_len;
+    let mpls_labels = parse_mpls_extensions(buffer, icmp_offset, packet_size);
+    
+    Some((router_ip, mpls_labels))
+}
+
 /// Poll the ICMP socket for Time Exceeded messages
 /// 
 /// After sending a probe packet with low TTL, we wait for the router at that
