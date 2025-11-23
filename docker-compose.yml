@@ -28,6 +28,8 @@ services:
     container_name: zerotrace-ws
     restart: unless-stopped
     privileged: true
+    environment:
+      - SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP:-0.0.0.0}
     # Required for ICMP packet capture
     cap_add:
       - NET_RAW

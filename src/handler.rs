@@ -89,16 +89,26 @@ pub async fn handle_client(
     let tcp = ws.get_ref();
     let tcp_fd = tcp.as_raw_fd();
     
-    // Get local (server) address and remote (client after NAT) address
-    // We'll trace the path FROM our server TO the client
-    let (local_addr, remote_addr) = unsafe {
-        let mut local: libc::sockaddr_storage = std::mem::zeroed();
-        let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
+    // Get local (server) address and remote (client) address for traceroute
+    // IMPORTANT: We need the REAL public IPs, not Docker internal IPs
+    let (local_addr, remote_addr) = {
+        // Don't use getsockname - it gives us Docker internal IP!
+        // Instead, we'll use a hardcoded or env var for server's public IP
         
-        let local_in = &*((&local) as *const _ as *const libc::sockaddr_in);
-        let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
-        let local_port = u16::from_be(local_in.sin_port);
+        // Try to get server's public IP from environment or use a default
+        let server_public_ip = std::env::var("SERVER_PUBLIC_IP")
+            .ok()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .unwrap_or_else(|| {
+                // Fallback: try to detect it (in production, set SERVER_PUBLIC_IP env var!)
+                eprintln!("[DEBUG handler] WARNING: SERVER_PUBLIC_IP not set, using 0.0.0.0 as placeholder");
+                Ipv4Addr::new(0, 0, 0, 0)
+            });
+        
+        eprintln!("[DEBUG handler] Server public IP: {}", server_public_ip);
+        
+        // For source port, we can use any ephemeral port
+        let local_port = 12345u16;
         
         // ALWAYS use real client IP from headers (required behind proxy like Traefik)
         let remote_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
@@ -118,11 +128,10 @@ pub async fn handle_client(
             }
         };
         
-        // For traceroute, we use arbitrary port (doesn't matter much)
-        // The important part is the IP address
-        let remote_port = 80;
+        // For destination port, use common port (doesn't really matter for traceroute)
+        let remote_port = 443;
         
-        ((local_ip, local_port), (remote_ip, remote_port))
+        ((server_public_ip, local_port), (remote_ip, remote_port))
     };
     
     eprintln!("[DEBUG handler] Tracing path: Server {}:{} -> Client {}:{}", 
