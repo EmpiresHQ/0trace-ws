@@ -404,81 +404,6 @@ fn parse_mpls_extensions(buffer: &[u8], icmp_offset: usize, packet_size: usize) 
 }
 
 /// Check if received packet is ICMP Time Exceeded for our probe
-fn is_matching_icmp_time_exceeded(
-    buffer: &[u8],
-    packet_size: usize,
-    expected_ip_id: u16,
-) -> Option<(Ipv4Addr, Vec<MplsLabel>)> {
-    // Check minimum size: Ethernet + IP + ICMP headers
-    if packet_size < ETHERNET_HEADER_LEN + IP_HEADER_LEN {
-        eprintln!("[DEBUG] Packet too small for Ethernet + IP header");
-        return None;
-    }
-    
-    // Check EtherType (0x0800 = IPv4)
-    let ethertype = u16::from_be_bytes([buffer[12], buffer[13]]);
-    eprintln!("[DEBUG] EtherType=0x{:04x}", ethertype);
-    if ethertype != 0x0800 {
-        return None;
-    }
-    
-    // IP header starts after Ethernet header
-    let ip_offset = ETHERNET_HEADER_LEN;
-    let ip_header_len = ((buffer[ip_offset] & 0x0F) * 4) as usize;
-    let ip_protocol = buffer[ip_offset + 9];
-    
-    let (src_ip, dst_ip) = extract_ip_addresses(buffer, ip_offset);
-    eprintln!("[DEBUG] IP protocol={}, {} -> {}", ip_protocol, src_ip, dst_ip);
-    
-    // Check if this is ICMP (protocol 1)
-    if ip_protocol != 1 {
-        return None;
-    }
-    
-    if packet_size < ip_offset + ip_header_len + ICMP_HEADER_LEN {
-        eprintln!("[DEBUG] Packet too small for ICMP header");
-        return None;
-    }
-    
-    // Parse ICMP header
-    let icmp_offset = ip_offset + ip_header_len;
-    let icmp_type = buffer[icmp_offset];
-    let icmp_code = buffer[icmp_offset + 1];
-    
-    eprintln!("[DEBUG] ICMP type={}, code={}", icmp_type, icmp_code);
-    
-    // Check if this is ICMP Time Exceeded (type 11, code 0)
-    if icmp_type != ICMP_TIME_EXCEEDED || icmp_code != ICMP_EXC_TTL {
-        return None;
-    }
-    
-    // ICMP Time Exceeded contains the original IP header in its payload
-    let orig_ip_offset = icmp_offset + ICMP_HEADER_LEN;
-    if packet_size < orig_ip_offset + IP_HEADER_LEN {
-        eprintln!("[DEBUG] No original IP header in ICMP payload");
-        return None;
-    }
-    
-    // Extract IP ID from the original packet's IP header
-    let orig_ip_id = u16::from_be_bytes([
-        buffer[orig_ip_offset + 4],
-        buffer[orig_ip_offset + 5]
-    ]);
-    eprintln!("[DEBUG] Original packet IP ID: {}, expected: {}", orig_ip_id, expected_ip_id);
-    
-    // Check if this ICMP is in response to our probe
-    if orig_ip_id != expected_ip_id {
-        eprintln!("[DEBUG] IP ID mismatch, continuing to listen...");
-        return None;
-    }
-    
-    // Parse MPLS extensions
-    let mpls_labels = parse_mpls_extensions(buffer, icmp_offset, packet_size);
-    
-    eprintln!("[DEBUG] Match! Router IP: {}", src_ip);
-    Some((src_ip, mpls_labels))
-}
-
 /// Poll the ICMP socket for Time Exceeded messages matching ANY of the expected IP IDs
 /// 
 /// This is the key function for 0trace - we receive any ICMP Time Exceeded message
@@ -620,8 +545,6 @@ fn parse_icmp_time_exceeded(buffer: &[u8], packet_size: usize, _expected_ip_id: 
 /// 
 /// This approach is similar to the Go implementation which uses pcap - we
 /// capture ICMP packets and match them by IP ID in the embedded original packet.
-/// 
-/// Returns the router info with MPLS labels if a matching ICMP Time Exceeded is found, None if timeout.
 /// Set socket receive timeout
 fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64) {
     let timeout_val = libc::timeval {
@@ -642,83 +565,6 @@ fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64) {
     } else {
         eprintln!("[DEBUG] Socket timeout set to {}s", timeout_seconds);
     }
-}
-
-pub async fn poll_icmp_socket(socket_fd: RawFd, expected_ip_id: u16) -> Result<Option<HopInfo>> {
-    // Receive ICMP packets using recvfrom. This is a blocking syscall;
-    // call it inside spawn_blocking so we don't block the Tokio reactor.
-    let result = tokio::task::spawn_blocking(move || {
-        eprintln!("[DEBUG poll_icmp_socket] Starting, fd={}, expecting IP ID={}", socket_fd, expected_ip_id);
-        
-        // First, check if the socket can receive anything at all
-        // Try a quick non-blocking peek
-        let mut test_buf = [0u8; 1];
-        let peek_result = unsafe {
-            libc::recv(socket_fd, test_buf.as_mut_ptr() as *mut c_void, 1, libc::MSG_DONTWAIT | libc::MSG_PEEK)
-        };
-        eprintln!("[DEBUG poll_icmp_socket] Non-blocking peek result: {} (errno: {:?})", 
-            peek_result, if peek_result < 0 { Some(std::io::Error::last_os_error()) } else { None });
-        
-        // Set a 2-second receive timeout
-        set_receive_timeout(socket_fd, 2);
-        
-        // Buffer for receiving ICMP packet + IP header
-        let mut receive_buffer = [0u8; PACKET_BUFFER_SIZE];
-        let mut src_addr: sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut addr_len: libc::socklen_t = std::mem::size_of::<sockaddr_in>() as u32;
-        
-        // Try multiple times to receive ICMP packets
-        // We may receive other ICMP packets (pings, etc.) before ours
-        // The timeout on the socket is 2s, so recvfrom will block waiting for packets
-        // We loop to handle receiving unrelated ICMP packets before ours arrives
-        const MAX_RECEIVE_ATTEMPTS: u32 = 20;
-        for attempt in 1..=MAX_RECEIVE_ATTEMPTS {
-            eprintln!("[DEBUG poll_icmp_socket] Attempt {} of {}", attempt, MAX_RECEIVE_ATTEMPTS);
-            
-            let bytes_received = unsafe {
-                recvfrom(
-                    socket_fd,
-                    receive_buffer.as_mut_ptr() as *mut c_void,
-                    receive_buffer.len(),
-                    0,
-                    &mut src_addr as *mut _ as *mut libc::sockaddr,
-                    &mut addr_len,
-                )
-            };
-            
-            if bytes_received < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut {
-                    eprintln!("[DEBUG poll_icmp_socket] Timeout waiting for ICMP (no packets received)");
-                    // Timeout means no ICMP packets arrived at all within 2s
-                    return Ok(None);
-                }
-                eprintln!("[DEBUG poll_icmp_socket] recvfrom error: {}", error);
-                return Err(error);
-            }
-            
-            let packet_size = bytes_received as usize;
-            eprintln!("[DEBUG poll_icmp_socket] Received {} bytes from link layer", packet_size);
-            
-            // Parse and check if this is our ICMP Time Exceeded response
-            if let Some((router_ip, mpls_labels)) = is_matching_icmp_time_exceeded(
-                &receive_buffer,
-                packet_size,
-                expected_ip_id,
-            ) {
-                return Ok(Some(HopInfo {
-                    router_ip: router_ip.to_string(),
-                    mpls_labels,
-                }));
-            }
-        }
-        
-        eprintln!("[DEBUG poll_icmp_socket] No matching ICMP Time Exceeded received");
-        Ok(None)
-    })
-    .await?;
-
-    result.map_err(|e| anyhow!(e))
 }
 
 #[cfg(test)]
