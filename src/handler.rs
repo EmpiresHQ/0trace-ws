@@ -170,36 +170,31 @@ pub async fn handle_client(
         .send(Message::Text(r#"{"type":"connected","message":"Trace started automatically"}"#.into()))
         .await;
 
-    // Tracing task
+    // 0trace approach: Send ALL probe packets immediately, then collect ICMP responses
+    // This is the key difference from traditional traceroute which sends one packet,
+    // waits for response, then sends the next one
+    
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let peer_id_clone = peer_id.clone();
     
     // Generate a base TCP sequence number for our probe packets
-    // Each TTL will use seq_base + ttl to make packets unique
     let seq_base = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() & 0xFFFFFFFF) as u32;
 
     let trace_task = tokio::spawn(async move {
-        // Traceroute: increment TTL from 1 to max_hops
-        // Each iteration sends a probe packet and waits for ICMP response
+        // Map to track IP IDs -> (TTL, send_time)
+        let mut probe_map = std::collections::HashMap::new();
+        
+        eprintln!("[DEBUG handler] === 0trace: Sending ALL probes (TTL 1-{}) ===", max_hops);
+        
+        // STEP 1: Send all probe packets at once (0trace technique)
         for ttl in 1..=max_hops {
-            eprintln!("[DEBUG handler] === Starting hop TTL={} ===", ttl);
-            
-            // Send a crafted TCP packet with the current TTL
-            // The packet mimics the real connection (same src/dst IP:port)
-            // but has a low TTL that will expire at the target hop
-            let send_at = tokio::time::Instant::now();
             let seq = seq_base.wrapping_add(ttl as u32);
+            let send_at = tokio::time::Instant::now();
             
-            eprintln!("[DEBUG handler] Sending raw TCP probe for TTL={}", ttl);
-            
-            // send_tcp_probe crafts a complete IP + TCP packet with:
-            // - Custom TTL (will expire at router #ttl)
-            // - Source/dest matching the real WebSocket connection
-            // - Unique IP ID for packet identification
-            let ip_id = match send_tcp_probe(
+            match send_tcp_probe(
                 raw_fd,
                 local_addr.0,   // src_ip (our server)
                 remote_addr.0,  // dst_ip (client)
@@ -208,90 +203,106 @@ pub async fn handle_client(
                 seq,
                 ttl,
             ) {
-                Ok(id) => id,
+                Ok(ip_id) => {
+                    probe_map.insert(ip_id, (ttl, send_at));
+                    eprintln!("[DEBUG handler] Sent probe TTL={}, IP_ID={}", ttl, ip_id);
+                }
                 Err(e) => {
-                    eprintln!("[DEBUG handler] Failed to send probe: {}", e);
-                    event_bus().emit(
-                        "error",
-                        &serde_json::json!({"clientId": peer_id_clone, "message": format!("send probe failed: {}", e)}),
-                    );
-                    break;
+                    eprintln!("[DEBUG handler] Failed to send probe TTL={}: {}", ttl, e);
                 }
-            };
+            }
             
-            eprintln!("[DEBUG handler] Probe sent (IP ID={}), waiting for ICMP response...", ip_id);
-
-            // Poll the ICMP socket for Time Exceeded messages
-            // The ICMP socket receives all ICMP packets; we filter by IP ID
-            // to match responses to our specific probe packet
-            match timeout(ttl_timeout, async move { poll_icmp_socket(icmp_fd, ip_id).await }).await {
-                Ok(Ok(Some(hop_info))) => {
-                    let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms, MPLS labels: {}", 
-                        hop_info.router_ip, rtt_ms, hop_info.mpls_labels.len());
-                    
-                    let hop = Hop {
-                        client_id: peer_id_clone.clone(),
-                        ttl,
-                        router: hop_info.router_ip.clone(),
-                        rtt_ms,
-                    };
-                    let payload = serde_json::to_value(&hop).unwrap();
-                    event_bus().emit("hop", &payload);
-                    
-                    // Send hop to client with type field and MPLS labels
-                    let mpls_json: Vec<serde_json::Value> = hop_info.mpls_labels.iter().map(|l| {
-                        serde_json::json!({
-                            "label": l.label,
-                            "exp": l.exp,
-                            "ttl": l.ttl
-                        })
-                    }).collect();
-                    
-                    let hop_msg = serde_json::json!({
-                        "type": "hop",
-                        "clientId": peer_id_clone.clone(),
-                        "ttl": ttl,
-                        "ip": hop_info.router_ip,
-                        "router": hop_info.router_ip,
-                        "rtt_ms": rtt_ms,
-                        "mpls": mpls_json
-                    });
-                    let _ = ws_writer
-                        .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
-                        .await;
+            // Small delay between sends to avoid overwhelming the network
+            tokio::time::sleep(Duration::from_micros(100)).await;
+        }
+        
+        eprintln!("[DEBUG handler] === All {} probes sent, collecting ICMP responses ===", probe_map.len());
+        
+        // STEP 2: Collect ICMP responses for all probes
+        // We listen for ICMP Time Exceeded messages and match them by IP ID
+        let mut received_hops = std::collections::HashSet::new();
+        let collection_deadline = tokio::time::Instant::now() + ttl_timeout * 3; // Give more time for all responses
+        
+        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline {
+            // Try to receive any ICMP response (we don't know which TTL will respond first)
+            // In 0trace, responses can come in any order
+            
+            // Pick first remaining probe to wait for
+            if let Some((&ip_id, &(ttl, send_at))) = probe_map.iter().next() {
+                let remaining_time = collection_deadline.saturating_duration_since(tokio::time::Instant::now());
+                
+                match timeout(remaining_time, async move { poll_icmp_socket(icmp_fd, ip_id).await }).await {
+                    Ok(Ok(Some(hop_info))) => {
+                        probe_map.remove(&ip_id);
+                        received_hops.insert(ttl);
+                        
+                        let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
+                        eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms", 
+                            ttl, hop_info.router_ip, rtt_ms);
+                        
+                        let hop = Hop {
+                            client_id: peer_id_clone.clone(),
+                            ttl,
+                            router: hop_info.router_ip.clone(),
+                            rtt_ms,
+                        };
+                        let payload = serde_json::to_value(&hop).unwrap();
+                        event_bus().emit("hop", &payload);
+                        
+                        // Send hop to client with MPLS labels
+                        let mpls_json: Vec<serde_json::Value> = hop_info.mpls_labels.iter().map(|l| {
+                            serde_json::json!({
+                                "label": l.label,
+                                "exp": l.exp,
+                                "ttl": l.ttl
+                            })
+                        }).collect();
+                        
+                        let hop_msg = serde_json::json!({
+                            "type": "hop",
+                            "clientId": peer_id_clone.clone(),
+                            "ttl": ttl,
+                            "ip": hop_info.router_ip,
+                            "router": hop_info.router_ip,
+                            "rtt_ms": rtt_ms,
+                            "mpls": mpls_json
+                        });
+                        let _ = ws_writer
+                            .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
+                            .await;
+                    }
+                    Ok(Ok(None)) | Err(_) => {
+                        // No response or timeout for this probe
+                        probe_map.remove(&ip_id);
+                        eprintln!("[DEBUG handler] No response for TTL={}", ttl);
+                        
+                        let _ = ws_writer
+                            .send(Message::Text(format!(
+                                r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
+                                ttl
+                            )))
+                            .await;
+                    }
+                    Ok(Err(e)) => {
+                        probe_map.remove(&ip_id);
+                        eprintln!("[DEBUG handler] Error for TTL={}: {}", ttl, e);
+                    }
                 }
-                Ok(Ok(None)) => {
-                    eprintln!("[DEBUG handler] No ICMP response (poll_icmp_socket returned None)");
-                    // No ICMP response - could mean:
-                    // - Router doesn't send ICMP (filtered/configured not to)
-                    // - We reached the destination (no TTL expiry)
-                    // - Packet was lost
-                    let _ = ws_writer
-                        .send(Message::Text(format!(
-                            r#"{{"type":"hop","ttl":{},"note":"no-icmp"}}"#,
-                            ttl
-                        )))
-                        .await;
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[DEBUG handler] Error reading errqueue: {}", e);
-                    event_bus().emit(
-                        "error",
-                        &serde_json::json!({"clientId": peer_id_clone, "message": format!("errqueue read error: {}", e)}),
-                    );
-                    break;
-                }
-                Err(_) => {
-                    eprintln!("[DEBUG handler] Timeout waiting for ICMP");
-                    // Timeout - router didn't respond in time
-                    let _ = ws_writer
-                        .send(Message::Text(format!(
-                            r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
-                            ttl
-                        )))
-                        .await;
-                }
+            } else {
+                break;
+            }
+        }
+        
+        // Report any probes that never got a response
+        for (ip_id, (ttl, _)) in probe_map {
+            if !received_hops.contains(&ttl) {
+                eprintln!("[DEBUG handler] Timeout for TTL={} (IP_ID={})", ttl, ip_id);
+                let _ = ws_writer
+                    .send(Message::Text(format!(
+                        r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
+                        ttl
+                    )))
+                    .await;
             }
         }
 
