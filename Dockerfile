@@ -29,6 +29,7 @@ RUN npm ci
 # Copy source code
 COPY src ./src
 COPY *.ts ./
+COPY index.js ./
 COPY public ./public
 
 # Build Rust native module
