@@ -144,15 +144,19 @@ pub async fn handle_client(
         }
     };
     
-    // 0trace approach: Use ACTUAL WebSocket connection source (container IP:port)
-    // and trace to REAL client IP. This works because:
-    // 1. Packets are sent from container (same source as WebSocket)
-    // 2. ICMP replies will be routed back to container
-    // 3. We send all probes at once (0trace speed)
-    let trace_params = (ws_local_addr.0, ws_local_addr.1, real_client_ip, 443u16);
+    // 0trace approach: Use ACTUAL WebSocket connection parameters
+    // Send probe packets that perfectly mimic the real WebSocket connection:
+    // - Same source IP:port (container side of WebSocket)
+    // - Same dest IP:port (client side of WebSocket)
+    // This makes probes indistinguishable from the real connection, avoiding:
+    // 1. Port scanning detection (sending to 80/443 when client uses different port)
+    // 2. IDS/IPS triggers (suspicious traffic patterns)
+    // 3. Makes probes look like legitimate retransmissions/packet loss
+    let trace_params = (ws_local_addr.0, ws_local_addr.1, real_client_ip, ws_peer_addr.1);
     
     eprintln!("[DEBUG handler] Trace packets: {}:{} -> {}:{}", 
         trace_params.0, trace_params.1, trace_params.2, trace_params.3);
+    eprintln!("[DEBUG handler] (Mimicking actual WebSocket connection for stealth)");
 
     // Create a raw IP socket for sending custom TCP packets with specific TTL
     // This is the key to 0trace: we send packets that mimic the real connection
