@@ -57,9 +57,6 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      - name: Image digest
-        run: echo ${{ steps.meta.outputs.tags }}
-
       - name: Deploy to server
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: appleboy/scp-action@v0.1.7
