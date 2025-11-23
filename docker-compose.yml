@@ -8,7 +8,7 @@ services:
     container_name: zerotrace-ws
     restart: unless-stopped
     networks:
-      - traefik
+      - web
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.zerotrace.rule=Host(`${DOMAIN}`)"
@@ -23,6 +23,7 @@ services:
       - "traefik.http.routers.zerotrace-ws.tls=true"
       - "traefik.http.routers.zerotrace-ws.tls.certresolver=myresolver"
       - "traefik.http.services.zerotrace-ws.loadbalancer.server.port=8080"
+      - "traefik.docker.network=web"
     environment:
       - NODE_ENV=production
 
