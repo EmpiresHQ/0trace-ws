@@ -69,6 +69,7 @@ pub fn create_icmp_socket(_bind_addr: Option<Ipv4Addr>) -> Result<RawFd> {
         sll.sll_family = AF_PACKET as u16;
         sll.sll_protocol = htons(ETH_P_IP as u16);
         sll.sll_ifindex = ifindex as i32;
+        sll.sll_pkttype = 0; // 0 = PACKET_HOST (packets for this host), will receive all types
         
         let rc = unsafe {
             bind(
@@ -324,9 +325,19 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             let ip_start = eth_header_len;
             let ip_header_len = ((buf[ip_start] & 0x0F) * 4) as usize;
             
+            // Log source and dest IP for debugging
+            let src_ip = std::net::Ipv4Addr::new(
+                buf[ip_start + 12], buf[ip_start + 13], 
+                buf[ip_start + 14], buf[ip_start + 15]
+            );
+            let dst_ip = std::net::Ipv4Addr::new(
+                buf[ip_start + 16], buf[ip_start + 17], 
+                buf[ip_start + 18], buf[ip_start + 19]
+            );
+            
             // Check if this is ICMP (protocol 1)
             let ip_protocol = buf[ip_start + 9];
-            eprintln!("[DEBUG poll_icmp_socket] IP protocol={}", ip_protocol);
+            eprintln!("[DEBUG poll_icmp_socket] IP protocol={}, {} -> {}", ip_protocol, src_ip, dst_ip);
             if ip_protocol != 1 {  // 1 = ICMP
                 // Skip non-ICMP packets silently (too much noise)
                 continue;
