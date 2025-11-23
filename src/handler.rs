@@ -1,5 +1,5 @@
 use crate::events::event_bus;
-use crate::socket2::{create_raw_socket, create_icmp_socket, poll_icmp_socket, send_tcp_probe};
+use crate::socket::{create_raw_socket, create_icmp_socket, poll_icmp_socket, send_tcp_probe};
 use crate::types::Hop;
 use futures::{SinkExt, StreamExt};
 use std::net::{SocketAddr, Ipv4Addr};

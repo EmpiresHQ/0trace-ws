@@ -9,7 +9,6 @@
 mod events;
 mod handler;
 mod socket;
-mod socket2;
 mod types;
 
 use napi_derive::napi;

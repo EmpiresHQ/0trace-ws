@@ -2,398 +2,591 @@ use anyhow::{anyhow, Result};
 use std::os::fd::RawFd;
 use std::net::Ipv4Addr;
 use libc::{
-    c_int, c_void, cmsghdr, iovec, msghdr, recvmsg, sendto, setsockopt, sock_extended_err, 
-    sockaddr_in, socket, close, AF_INET, IPPROTO_RAW, IPPROTO_TCP, SOCK_RAW,
-    IP_RECVERR, IP_TTL, IP_HDRINCL, MSG_ERRQUEUE, SOL_IP,
+    c_int, c_void, recvfrom, sendto, setsockopt,
+    sockaddr_in, sockaddr_ll, socket, close, htons, bind, if_nametoindex, AF_INET, AF_PACKET, IPPROTO_RAW, IPPROTO_TCP, SOCK_RAW,
+    IP_HDRINCL, SOL_IP, ETH_P_IP,
 };
 
 // ICMP constants
-#[allow(dead_code)]
 const ICMP_TIME_EXCEEDED: u8 = 11;
-#[allow(dead_code)]
 const ICMP_EXC_TTL: u8 = 0;
-#[allow(dead_code)]
-const SO_EE_ORIGIN_ICMP: u8 = 2;
+
+// Packet structure constants
+const IP_HEADER_LEN: usize = 20;
+const TCP_HEADER_LEN: usize = 20;
+const ICMP_HEADER_LEN: usize = 8;
+const ETHERNET_HEADER_LEN: usize = 14;
+const PACKET_BUFFER_SIZE: usize = 1500;
+const ICMP_EXTENSION_OFFSET: usize = 128;
+const ICMP_EXTENSION_VERSION: u8 = 2;
+
+// ICMP extension classes
+const ICMP_EXT_CLASS_MPLS: u8 = 1;
+const ICMP_EXT_TYPE_MPLS_STACK: u8 = 1;
+
+/// MPLS label stack entry
+#[derive(Debug, Clone)]
+pub struct MplsLabel {
+    pub label: u32,
+    pub exp: u8,
+    pub ttl: u8,
+}
+
+/// Hop information including router IP and optional MPLS labels
+#[derive(Debug, Clone)]
+pub struct HopInfo {
+    pub router_ip: String,
+    pub mpls_labels: Vec<MplsLabel>,
+}
+
+/// Calculate IP header checksum
+fn calculate_ip_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for i in (0..IP_HEADER_LEN).step_by(2) {
+        if i == 10 { continue; } // Skip checksum field
+        sum += u16::from_be_bytes([header[i], header[i+1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Calculate TCP checksum with pseudo-header
+fn calculate_tcp_checksum(ip_header: &[u8], tcp_header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    
+    // Pseudo-header: source IP, dest IP, protocol, TCP length
+    sum += u16::from_be_bytes([ip_header[12], ip_header[13]]) as u32;
+    sum += u16::from_be_bytes([ip_header[14], ip_header[15]]) as u32;
+    sum += u16::from_be_bytes([ip_header[16], ip_header[17]]) as u32;
+    sum += u16::from_be_bytes([ip_header[18], ip_header[19]]) as u32;
+    sum += (IPPROTO_TCP as u16) as u32;
+    sum += TCP_HEADER_LEN as u32;
+    
+    // TCP header
+    for i in (0..TCP_HEADER_LEN).step_by(2) {
+        if i == 16 { continue; } // Skip checksum field (offset 16 in TCP header)
+        sum += u16::from_be_bytes([tcp_header[i], tcp_header[i+1]]) as u32;
+    }
+    
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build IP header with specified parameters
+fn build_ip_header(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    ttl: u8,
+    total_length: u16,
+) -> ([u8; IP_HEADER_LEN], u16) {
+    let mut header = [0u8; IP_HEADER_LEN];
+    
+    header[0] = 0x45; // Version (4) + IHL (5)
+    header[1] = 0x00; // DSCP + ECN
+    header[2..4].copy_from_slice(&total_length.to_be_bytes());
+    
+    // Generate IP ID based on current time
+    let ip_id = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() & 0xFFFF) as u16;
+    header[4..6].copy_from_slice(&ip_id.to_be_bytes());
+    
+    header[6] = 0x40; // Flags: Don't Fragment
+    header[7] = 0x00; // Fragment offset
+    header[8] = ttl;
+    header[9] = IPPROTO_TCP as u8;
+    header[12..16].copy_from_slice(&u32::from(src_ip).to_be_bytes());
+    header[16..20].copy_from_slice(&u32::from(dst_ip).to_be_bytes());
+    
+    let checksum = calculate_ip_checksum(&header);
+    header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    
+    (header, ip_id)
+}
+
+/// Build TCP header with specified parameters
+fn build_tcp_header(
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+) -> [u8; TCP_HEADER_LEN] {
+    let mut header = [0u8; TCP_HEADER_LEN];
+    
+    header[0..2].copy_from_slice(&src_port.to_be_bytes());
+    header[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    header[4..8].copy_from_slice(&seq_num.to_be_bytes());
+    header[8..12].copy_from_slice(&0u32.to_be_bytes()); // ACK number
+    header[12] = 0x50; // Data offset (5 * 4 = 20 bytes)
+    header[13] = 0x02; // Flags: SYN
+    header[14..16].copy_from_slice(&8192u16.to_be_bytes()); // Window size
+    header[18..20].copy_from_slice(&0u16.to_be_bytes()); // Urgent pointer
+    
+    header
+}
 
 /// Create a raw IP socket for sending custom TCP packets
-#[allow(dead_code)]
+/// 
+/// This socket allows us to craft complete IP packets with custom headers,
+/// including setting specific TTL values. Required for the 0trace technique.
 pub fn create_raw_socket() -> Result<RawFd> {
-    let fd = unsafe { socket(AF_INET, SOCK_RAW, IPPROTO_RAW) };
-    if fd < 0 {
+    let socket_fd = unsafe { socket(AF_INET, SOCK_RAW, IPPROTO_RAW) };
+    if socket_fd < 0 {
         return Err(std::io::Error::last_os_error()).map_err(|e| anyhow!(e));
     }
     
     // Enable IP_HDRINCL so we can set our own IP header (including TTL)
-    let one: c_int = 1;
-    let rc = unsafe {
+    let enable_flag: c_int = 1;
+    let result = unsafe {
         setsockopt(
-            fd,
+            socket_fd,
             SOL_IP,
             IP_HDRINCL,
-            &one as *const _ as *const c_void,
+            &enable_flag as *const _ as *const c_void,
             std::mem::size_of::<c_int>() as u32,
         )
     };
-    if rc != 0 {
-        unsafe { close(fd) };
+    if result != 0 {
+        unsafe { close(socket_fd) };
         return Err(std::io::Error::last_os_error()).map_err(|e| anyhow!(e));
     }
     
-    eprintln!("[DEBUG create_raw_socket] Created raw socket fd={}", fd);
-    Ok(fd)
+    eprintln!("[DEBUG create_raw_socket] Created raw socket fd={}", socket_fd);
+    Ok(socket_fd)
+}
+
+/// Create a packet capture socket for receiving ICMP Time Exceeded messages
+/// 
+/// This creates an AF_PACKET socket which captures at the link layer,
+/// similar to how the Go implementation uses pcap. This is necessary because
+/// ICMP error messages (Time Exceeded) are not delivered to regular ICMP sockets -
+/// they're handled specially by the kernel and delivered via IP_RECVERR or
+/// visible only at the link layer.
+/// 
+/// AF_PACKET socket receives ALL IP packets, so we filter in userspace.
+/// Bind socket to network interface
+fn bind_to_interface(socket_fd: RawFd, interface_name: &str) {
+    let ifname_cstr = format!("{}\0", interface_name);
+    let interface_index = unsafe { if_nametoindex(ifname_cstr.as_ptr() as *const libc::c_char) };
+    
+    if interface_index == 0 {
+        eprintln!("[DEBUG] Warning: Could not find {} interface, will receive from all", interface_name);
+        return;
+    }
+    
+    let mut socket_addr: sockaddr_ll = unsafe { std::mem::zeroed() };
+    socket_addr.sll_family = AF_PACKET as u16;
+    socket_addr.sll_protocol = htons(ETH_P_IP as u16);
+    socket_addr.sll_ifindex = interface_index as i32;
+    socket_addr.sll_pkttype = 0; // PACKET_HOST
+    
+    let result = unsafe {
+        bind(
+            socket_fd,
+            &socket_addr as *const sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<sockaddr_ll>() as u32,
+        )
+    };
+    
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        eprintln!("[DEBUG] Warning: Failed to bind to {}: {}", interface_name, error);
+    } else {
+        eprintln!("[DEBUG] Bound to {} (ifindex={})", interface_name, interface_index);
+    }
+}
+
+/// Set socket receive buffer size
+fn set_receive_buffer_size(socket_fd: RawFd, size_bytes: c_int) {
+    let result = unsafe {
+        setsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size_bytes as *const _ as *const c_void,
+            std::mem::size_of::<c_int>() as u32,
+        )
+    };
+    
+    if result < 0 {
+        eprintln!("[DEBUG] Warning: Failed to set SO_RCVBUF");
+    }
+}
+
+pub fn create_icmp_socket(_bind_addr: Option<Ipv4Addr>) -> Result<RawFd> {
+    // Create AF_PACKET socket to capture all IP packets at link layer
+    // This is like using pcap but with raw sockets
+    let socket_fd = unsafe { socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP as u16) as i32) };
+    if socket_fd < 0 {
+        return Err(std::io::Error::last_os_error()).map_err(|e| anyhow!(e));
+    }
+    
+    // Bind to eth0 interface (the main network interface in the container)
+    bind_to_interface(socket_fd, "eth0");
+    
+    // Set receive buffer size to ensure we don't miss packets (256KB)
+    set_receive_buffer_size(socket_fd, 256 * 1024);
+    
+    eprintln!("[DEBUG create_icmp_socket] Created AF_PACKET socket fd={} (link-layer capture)", socket_fd);
+    Ok(socket_fd)
 }
 
 /// Send a TCP packet with custom TTL using raw socket
-/// This crafts a minimal TCP packet to trigger ICMP Time Exceeded responses
-#[allow(dead_code)]
+/// 
+/// This crafts a complete IP + TCP packet mimicking an existing connection.
+/// The packet has a specific TTL that will cause it to expire at a router,
+/// triggering an ICMP Time Exceeded response.
+/// 
+/// Returns the IP ID of the sent packet for matching with ICMP responses.
 pub fn send_tcp_probe(
-    fd: RawFd,
+    socket_fd: RawFd,
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
-    seq: u32,
+    seq_num: u32,
     ttl: u8,
 ) -> Result<u16> {
     eprintln!("[DEBUG send_tcp_probe] Sending TCP probe: {}:{} -> {}:{} TTL={}", 
         src_ip, src_port, dst_ip, dst_port, ttl);
     
-    // Build IP header (20 bytes) + TCP header (20 bytes)
-    let mut packet = [0u8; 40];
+    const TOTAL_PACKET_LEN: u16 = (IP_HEADER_LEN + TCP_HEADER_LEN) as u16;
+    let mut packet = [0u8; TOTAL_PACKET_LEN as usize];
     
-    // IP Header
-    packet[0] = 0x45; // Version (4) + IHL (5)
-    packet[1] = 0x00; // DSCP + ECN
-    let total_len = 40u16;
-    packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+    // Build IP header
+    let (ip_header, packet_id) = build_ip_header(src_ip, dst_ip, ttl, TOTAL_PACKET_LEN);
+    packet[..IP_HEADER_LEN].copy_from_slice(&ip_header);
     
-    let ip_id = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() & 0xFFFF) as u16;
-    packet[4..6].copy_from_slice(&ip_id.to_be_bytes());
+    // Build TCP header
+    let mut tcp_header = build_tcp_header(src_port, dst_port, seq_num);
     
-    packet[6] = 0x40; // Flags: Don't Fragment
-    packet[7] = 0x00; // Fragment offset
-    packet[8] = ttl;  // TTL
-    packet[9] = IPPROTO_TCP as u8; // Protocol: TCP
-    // Checksum at [10..12] - will be filled by kernel with IP_HDRINCL
-    packet[12..16].copy_from_slice(&u32::from(src_ip).to_be_bytes());
-    packet[16..20].copy_from_slice(&u32::from(dst_ip).to_be_bytes());
+    // Calculate TCP checksum
+    let tcp_checksum = calculate_tcp_checksum(&ip_header, &tcp_header);
+    tcp_header[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
     
-    // Calculate IP checksum
-    let mut sum: u32 = 0;
-    for i in (0..20).step_by(2) {
-        if i == 10 { continue; } // Skip checksum field
-        sum += u16::from_be_bytes([packet[i], packet[i+1]]) as u32;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let ip_checksum = !(sum as u16);
-    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-    
-    // TCP Header
-    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
-    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    packet[24..28].copy_from_slice(&seq.to_be_bytes());
-    packet[28..32].copy_from_slice(&0u32.to_be_bytes()); // ACK
-    packet[32] = 0x50; // Data offset (5 * 4 = 20 bytes)
-    packet[33] = 0x02; // Flags: SYN
-    packet[34..36].copy_from_slice(&8192u16.to_be_bytes()); // Window
-    // TCP checksum at [36..38] - set to 0 for now
-    packet[38..40].copy_from_slice(&0u16.to_be_bytes()); // Urgent pointer
-    
-    // Calculate TCP checksum with pseudo-header
-    let mut sum: u32 = 0;
-    // Pseudo-header
-    sum += u16::from_be_bytes([packet[12], packet[13]]) as u32;
-    sum += u16::from_be_bytes([packet[14], packet[15]]) as u32;
-    sum += u16::from_be_bytes([packet[16], packet[17]]) as u32;
-    sum += u16::from_be_bytes([packet[18], packet[19]]) as u32;
-    sum += (IPPROTO_TCP as u16) as u32;
-    sum += 20u32; // TCP length
-    // TCP header
-    for i in (20..40).step_by(2) {
-        if i == 36 { continue; } // Skip checksum field
-        sum += u16::from_be_bytes([packet[i], packet[i+1]]) as u32;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let tcp_checksum = !(sum as u16);
-    packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+    packet[IP_HEADER_LEN..].copy_from_slice(&tcp_header);
     
     // Send packet
-    let dst_addr = sockaddr_in {
+    let dest_addr = sockaddr_in {
         sin_family: AF_INET as u16,
         sin_port: 0, // Ignored with IPPROTO_RAW
         sin_addr: libc::in_addr { s_addr: u32::from(dst_ip).to_be() },
         sin_zero: [0; 8],
     };
     
-    let rc = unsafe {
+    let bytes_sent = unsafe {
         sendto(
-            fd,
+            socket_fd,
             packet.as_ptr() as *const c_void,
             packet.len(),
             0,
-            &dst_addr as *const sockaddr_in as *const libc::sockaddr,
+            &dest_addr as *const sockaddr_in as *const libc::sockaddr,
             std::mem::size_of::<sockaddr_in>() as u32,
         )
     };
     
-    if rc < 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("[DEBUG send_tcp_probe] sendto failed: {}", e);
-        return Err(e).map_err(|e| anyhow!(e));
+    if bytes_sent < 0 {
+        let error = std::io::Error::last_os_error();
+        eprintln!("[DEBUG send_tcp_probe] sendto failed: {}", error);
+        return Err(error).map_err(|e| anyhow!(e));
     }
     
-    eprintln!("[DEBUG send_tcp_probe] Sent {} bytes, IP ID={}", rc, ip_id);
-    Ok(ip_id)
+    eprintln!("[DEBUG send_tcp_probe] Sent {} bytes, IP ID={}", bytes_sent, packet_id);
+    Ok(packet_id)
 }
 
-/// Enable IP_RECVERR on a socket to receive ICMP errors via MSG_ERRQUEUE
-#[allow(dead_code)]
-pub fn enable_ip_recverr(fd: RawFd) -> Result<()> {
-    eprintln!("[DEBUG enable_ip_recverr] Enabling IP_RECVERR on fd={}", fd);
-    let one: c_int = 1;
-    let rc = unsafe {
-        setsockopt(
-            fd,
-            SOL_IP,
-            IP_RECVERR,
-            &one as *const _ as *const c_void,
-            std::mem::size_of::<c_int>() as u32,
-        )
-    };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("[DEBUG enable_ip_recverr] Failed: {}", e);
-        return Err(e).map_err(|e| anyhow!(e));
-    }
-    
-    // Verify IP_RECVERR was set by reading it back
-    let mut recverr_val: c_int = 0;
-    let mut len: u32 = std::mem::size_of::<c_int>() as u32;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_IP,
-            IP_RECVERR,
-            &mut recverr_val as *mut _ as *mut c_void,
-            &mut len as *mut u32,
-        )
-    };
-    if rc == 0 {
-        eprintln!("[DEBUG enable_ip_recverr] Verified IP_RECVERR readback: {}", recverr_val);
-    } else {
-        eprintln!("[DEBUG enable_ip_recverr] Failed to read back IP_RECVERR");
-    }
-    
-    eprintln!("[DEBUG enable_ip_recverr] Success");
-    Ok(())
+/// Extract IP addresses from IP header
+fn extract_ip_addresses(buffer: &[u8], ip_offset: usize) -> (Ipv4Addr, Ipv4Addr) {
+    let src_ip = Ipv4Addr::new(
+        buffer[ip_offset + 12],
+        buffer[ip_offset + 13],
+        buffer[ip_offset + 14],
+        buffer[ip_offset + 15],
+    );
+    let dst_ip = Ipv4Addr::new(
+        buffer[ip_offset + 16],
+        buffer[ip_offset + 17],
+        buffer[ip_offset + 18],
+        buffer[ip_offset + 19],
+    );
+    (src_ip, dst_ip)
 }
 
-/// Set IP TTL (Time-To-Live) on a socket
-#[allow(dead_code)]
-pub fn set_ip_ttl(fd: RawFd, ttl: i32) -> Result<()> {
-    eprintln!("[DEBUG set_ip_ttl] Setting TTL={} on fd={}", ttl, fd);
-    let rc = unsafe {
-        setsockopt(
-            fd,
-            SOL_IP,
-            IP_TTL,
-            &ttl as *const _ as *const c_void,
-            std::mem::size_of::<i32>() as u32,
-        )
-    };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("[DEBUG set_ip_ttl] Failed: {}", e);
-        return Err(e).map_err(|e| anyhow!(e));
-    }
+/// Parse MPLS label from 4-byte word
+fn parse_mpls_label(label_word: u32) -> (MplsLabel, bool) {
+    let label = (label_word >> 12) & 0xFFFFF;
+    let exp = ((label_word >> 9) & 0x7) as u8;
+    let is_bottom_of_stack = ((label_word >> 8) & 0x1) == 1;
+    let ttl = (label_word & 0xFF) as u8;
     
-    // Verify TTL was set by reading it back
-    let mut read_ttl: i32 = 0;
-    let mut len: u32 = std::mem::size_of::<i32>() as u32;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_IP,
-            IP_TTL,
-            &mut read_ttl as *mut _ as *mut c_void,
-            &mut len as *mut u32,
-        )
-    };
-    if rc == 0 {
-        eprintln!("[DEBUG set_ip_ttl] Verified TTL readback: {}", read_ttl);
-    }
-    
-    eprintln!("[DEBUG set_ip_ttl] Success");
-    Ok(())
+    let mpls_label = MplsLabel { label, exp, ttl };
+    (mpls_label, is_bottom_of_stack)
 }
 
-/// Non-blocking poll of the kernel error queue for ICMP Time Exceeded router address.
-/// We use a small blocking recvmsg via a short-lived async block, but guarded by an outer timeout.
-#[allow(dead_code)]
-pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
-    // Do a single recvmsg(MSG_ERRQUEUE). This is a blocking syscall;
-    // call it inside spawn_blocking so we don't block the Tokio reactor.
-    // All structures must be created inside to avoid Send issues with raw pointers
-    let res = tokio::task::spawn_blocking(move || {
-        eprintln!("[DEBUG poll_errqueue] Starting, fd={}", fd);
+/// Parse MPLS extensions from ICMP packet (RFC 4884, RFC 4950)
+fn parse_mpls_extensions(buffer: &[u8], icmp_offset: usize, packet_size: usize) -> Vec<MplsLabel> {
+    let mut mpls_labels = Vec::new();
+    let extension_offset = icmp_offset + ICMP_EXTENSION_OFFSET;
+    
+    if packet_size <= extension_offset + 4 {
+        eprintln!("[DEBUG] Packet too small for extensions (size={}, need > {})", 
+            packet_size, extension_offset + 4);
+        return mpls_labels;
+    }
+    
+    let ext_version = (buffer[extension_offset] >> 4) & 0x0F;
+    let ext_checksum = u16::from_be_bytes([
+        buffer[extension_offset + 2],
+        buffer[extension_offset + 3]
+    ]);
+    
+    eprintln!("[DEBUG] Extension header at offset {}: version={}, checksum=0x{:04x}", 
+        extension_offset, ext_version, ext_checksum);
+    
+    if ext_version != ICMP_EXTENSION_VERSION {
+        eprintln!("[DEBUG] No ICMP extensions (version={}, expected {})", 
+            ext_version, ICMP_EXTENSION_VERSION);
+        return mpls_labels;
+    }
+    
+    eprintln!("[DEBUG] ICMP extensions present (version {})", ICMP_EXTENSION_VERSION);
+    
+    let mut obj_offset = extension_offset + 4;
+    while obj_offset + 4 <= packet_size {
+        let obj_len = u16::from_be_bytes([
+            buffer[obj_offset],
+            buffer[obj_offset + 1]
+        ]) as usize;
+        let class_num = buffer[obj_offset + 2];
+        let c_type = buffer[obj_offset + 3];
         
-        // Save original flags and set socket to blocking mode with a receive timeout
-        let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-        if orig_flags < 0 {
-            eprintln!("[DEBUG poll_errqueue] Failed to get socket flags");
-            return Err(std::io::Error::last_os_error());
-        }
-        eprintln!("[DEBUG poll_errqueue] Original flags: 0x{:x}, O_NONBLOCK={}", orig_flags, orig_flags & libc::O_NONBLOCK);
+        eprintln!("[DEBUG] Extension object: len={}, class={}, type={}", 
+            obj_len, class_num, c_type);
         
-        // Set to blocking (remove O_NONBLOCK)
-        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags & !libc::O_NONBLOCK) };
-        if rc < 0 {
-            eprintln!("[DEBUG poll_errqueue] Failed to set blocking mode");
-            return Err(std::io::Error::last_os_error());
-        }
-        
-        // Set a receive timeout of 1 second on the socket
-        let timeout_val = libc::timeval {
-            tv_sec: 1,
-            tv_usec: 0,
-        };
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &timeout_val as *const _ as *const c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            )
-        };
-        if rc < 0 {
-            eprintln!("[DEBUG poll_errqueue] Failed to set SO_RCVTIMEO");
-        } else {
-            eprintln!("[DEBUG poll_errqueue] Socket set to blocking mode with 1s timeout");
-        }
-        
-        // Prepare structures inside the blocking task
-        let mut cmsg_space = [0u8; 512];
-        let mut data_buf = [0u8; 1];
-        let mut iov = iovec {
-            iov_base: data_buf.as_mut_ptr() as *mut c_void,
-            iov_len: data_buf.len(),
-        };
-        let mut name: sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut msg: msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = &mut name as *mut _ as *mut c_void;
-        msg.msg_namelen = std::mem::size_of::<sockaddr_in>() as u32;
-        msg.msg_iov = &mut iov as *mut iovec;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_space.as_mut_ptr() as *mut c_void;
-        msg.msg_controllen = cmsg_space.len() as _;
-        
-        eprintln!("[DEBUG poll_errqueue] Calling recvmsg with MSG_ERRQUEUE...");
-        
-        // First, check if there's anything in the error queue without blocking
-        // by trying a non-blocking read first
-        let mut peek_msg: msghdr = msg;
-        let peek_rc = unsafe { recvmsg(fd, &mut peek_msg as *mut msghdr, MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
-        eprintln!("[DEBUG poll_errqueue] Non-blocking peek result: {}", peek_rc);
-        if peek_rc >= 0 {
-            eprintln!("[DEBUG poll_errqueue] Found data in error queue immediately!");
-            // Data is there, the actual read below will get it
+        if obj_len < 4 || obj_offset + obj_len > packet_size {
+            break;
         }
         
-        // Try multiple times in case ICMP arrives slightly delayed
-        let mut attempts = 0;
-        let rc = loop {
-            let result = unsafe { recvmsg(fd, &mut msg as *mut msghdr, MSG_ERRQUEUE) };
-            attempts += 1;
+        // Class 1, Type 1 = MPLS Stack Entry
+        if class_num == ICMP_EXT_CLASS_MPLS && c_type == ICMP_EXT_TYPE_MPLS_STACK {
+            eprintln!("[DEBUG] MPLS Stack Entry found");
+            let mut label_offset = obj_offset + 4;
             
-            if result >= 0 {
-                eprintln!("[DEBUG poll_errqueue] recvmsg success on attempt {}", attempts);
-                break result;
-            }
-            
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut {
-                eprintln!("[DEBUG poll_errqueue] recvmsg hard error: {} (kind: {:?})", e, e.kind());
-                // Restore original flags before returning
-                let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
-                return Err(e);
-            }
-            
-            if attempts >= 5 {
-                eprintln!("[DEBUG poll_errqueue] recvmsg failed after {} attempts: {} (kind: {:?})", attempts, e, e.kind());
-                eprintln!("[DEBUG poll_errqueue] This likely means no ICMP packets are arriving at the socket");
-                // Restore original flags before returning
-                let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
-                return Ok(None);
-            }
-            
-            eprintln!("[DEBUG poll_errqueue] Attempt {} failed, retrying...", attempts);
-            // Small delay between attempts
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        };
-        
-        eprintln!("[DEBUG poll_errqueue] recvmsg returned: {}", rc);
-        
-        // Restore original flags before returning
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
-        
-        eprintln!("[DEBUG poll_errqueue] recvmsg success, controllen={}, namelen={}", msg.msg_controllen, msg.msg_namelen);
-
-        // Walk cmsgs to locate sock_extended_err
-        unsafe {
-            let mut cmsg_ptr = msg.msg_control as *const cmsghdr;
-            let mut remaining = msg.msg_controllen as isize;
-            eprintln!("[DEBUG poll_errqueue] Walking control messages, remaining={}", remaining);
-            
-            while remaining >= std::mem::size_of::<cmsghdr>() as isize && !cmsg_ptr.is_null() {
-                let cmsg = &*cmsg_ptr;
-                let cmsg_len = cmsg.cmsg_len as isize;
-                eprintln!("[DEBUG poll_errqueue] cmsg: level={}, type={}, len={}", 
-                    cmsg.cmsg_level, cmsg.cmsg_type, cmsg_len);
+            while label_offset + 4 <= obj_offset + obj_len {
+                let label_word = u32::from_be_bytes([
+                    buffer[label_offset],
+                    buffer[label_offset + 1],
+                    buffer[label_offset + 2],
+                    buffer[label_offset + 3]
+                ]);
                 
-                if cmsg.cmsg_level == SOL_IP && cmsg.cmsg_type == IP_RECVERR {
-                    eprintln!("[DEBUG poll_errqueue] Found IP_RECVERR cmsg");
-                    if cmsg_len >= (std::mem::size_of::<cmsghdr>() + std::mem::size_of::<sock_extended_err>()) as isize {
-                        let ee_ptr = (cmsg_ptr as *const u8).add(std::mem::size_of::<cmsghdr>())
-                            as *const sock_extended_err;
-                        let ee = &*ee_ptr;
-                        eprintln!("[DEBUG poll_errqueue] sock_extended_err: ee_errno={}, ee_origin={}, ee_type={}, ee_code={}", 
-                            ee.ee_errno, ee.ee_origin, ee.ee_type, ee.ee_code);
-                        
-                        // Check if this is ICMP Time Exceeded
-                        if ee.ee_origin == SO_EE_ORIGIN_ICMP && ee.ee_type == ICMP_TIME_EXCEEDED && ee.ee_code == ICMP_EXC_TTL {
-                            eprintln!("[DEBUG poll_errqueue] Confirmed ICMP Time Exceeded");
-                            // The sender (router) is reported in msg_name for IP_RECVERR
-                            let ip = std::net::Ipv4Addr::from(u32::from_be(name.sin_addr.s_addr));
-                            eprintln!("[DEBUG poll_errqueue] Router IP from msg_name: {}", ip);
-                            return Ok(Some(ip.to_string()));
-                        } else {
-                            eprintln!("[DEBUG poll_errqueue] Not a Time Exceeded error, ignoring");
-                        }
-                    }
+                let (mpls_label, is_bottom) = parse_mpls_label(label_word);
+                eprintln!("[DEBUG] MPLS Label: {}, EXP: {}, S: {}, TTL: {}", 
+                    mpls_label.label, mpls_label.exp, is_bottom as u8, mpls_label.ttl);
+                
+                mpls_labels.push(mpls_label);
+                label_offset += 4;
+                
+                if is_bottom {
+                    break;
                 }
-                
-                // advance to next cmsg (CMSG_NXTHDR logic)
-                let next = ((cmsg_ptr as usize) + cmsg_len as usize + std::mem::size_of::<usize>()
-                    - 1)
-                    & !(std::mem::size_of::<usize>() - 1);
-                remaining -= next as isize - cmsg_ptr as isize;
-                cmsg_ptr = next as *const cmsghdr;
             }
         }
-        eprintln!("[DEBUG poll_errqueue] No IP_RECVERR found in control messages");
+        
+        obj_offset += obj_len;
+    }
+    
+    mpls_labels
+}
+
+/// Check if received packet is ICMP Time Exceeded for our probe
+fn is_matching_icmp_time_exceeded(
+    buffer: &[u8],
+    packet_size: usize,
+    expected_ip_id: u16,
+) -> Option<(Ipv4Addr, Vec<MplsLabel>)> {
+    // Check minimum size: Ethernet + IP + ICMP headers
+    if packet_size < ETHERNET_HEADER_LEN + IP_HEADER_LEN {
+        eprintln!("[DEBUG] Packet too small for Ethernet + IP header");
+        return None;
+    }
+    
+    // Check EtherType (0x0800 = IPv4)
+    let ethertype = u16::from_be_bytes([buffer[12], buffer[13]]);
+    eprintln!("[DEBUG] EtherType=0x{:04x}", ethertype);
+    if ethertype != 0x0800 {
+        return None;
+    }
+    
+    // IP header starts after Ethernet header
+    let ip_offset = ETHERNET_HEADER_LEN;
+    let ip_header_len = ((buffer[ip_offset] & 0x0F) * 4) as usize;
+    let ip_protocol = buffer[ip_offset + 9];
+    
+    let (src_ip, dst_ip) = extract_ip_addresses(buffer, ip_offset);
+    eprintln!("[DEBUG] IP protocol={}, {} -> {}", ip_protocol, src_ip, dst_ip);
+    
+    // Check if this is ICMP (protocol 1)
+    if ip_protocol != 1 {
+        return None;
+    }
+    
+    if packet_size < ip_offset + ip_header_len + ICMP_HEADER_LEN {
+        eprintln!("[DEBUG] Packet too small for ICMP header");
+        return None;
+    }
+    
+    // Parse ICMP header
+    let icmp_offset = ip_offset + ip_header_len;
+    let icmp_type = buffer[icmp_offset];
+    let icmp_code = buffer[icmp_offset + 1];
+    
+    eprintln!("[DEBUG] ICMP type={}, code={}", icmp_type, icmp_code);
+    
+    // Check if this is ICMP Time Exceeded (type 11, code 0)
+    if icmp_type != ICMP_TIME_EXCEEDED || icmp_code != ICMP_EXC_TTL {
+        return None;
+    }
+    
+    // ICMP Time Exceeded contains the original IP header in its payload
+    let orig_ip_offset = icmp_offset + ICMP_HEADER_LEN;
+    if packet_size < orig_ip_offset + IP_HEADER_LEN {
+        eprintln!("[DEBUG] No original IP header in ICMP payload");
+        return None;
+    }
+    
+    // Extract IP ID from the original packet's IP header
+    let orig_ip_id = u16::from_be_bytes([
+        buffer[orig_ip_offset + 4],
+        buffer[orig_ip_offset + 5]
+    ]);
+    eprintln!("[DEBUG] Original packet IP ID: {}, expected: {}", orig_ip_id, expected_ip_id);
+    
+    // Check if this ICMP is in response to our probe
+    if orig_ip_id != expected_ip_id {
+        eprintln!("[DEBUG] IP ID mismatch, continuing to listen...");
+        return None;
+    }
+    
+    // Parse MPLS extensions
+    let mpls_labels = parse_mpls_extensions(buffer, icmp_offset, packet_size);
+    
+    eprintln!("[DEBUG] Match! Router IP: {}", src_ip);
+    Some((src_ip, mpls_labels))
+}
+
+/// Poll the ICMP socket for Time Exceeded messages
+/// 
+/// After sending a probe packet with low TTL, we wait for the router at that
+/// hop to send back an ICMP Time Exceeded message. This function receives
+/// ICMP packets from the raw ICMP socket and filters for Time Exceeded matching
+/// our sent packet's IP ID.
+/// 
+/// This approach is similar to the Go implementation which uses pcap - we
+/// capture ICMP packets and match them by IP ID in the embedded original packet.
+/// 
+/// Returns the router info with MPLS labels if a matching ICMP Time Exceeded is found, None if timeout.
+/// Set socket receive timeout
+fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64) {
+    let timeout_val = libc::timeval {
+        tv_sec: timeout_seconds,
+        tv_usec: 0,
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeout_val as *const _ as *const c_void,
+            std::mem::size_of::<libc::timeval>() as u32,
+        )
+    };
+    if result < 0 {
+        eprintln!("[DEBUG] Failed to set SO_RCVTIMEO");
+    } else {
+        eprintln!("[DEBUG] Socket timeout set to {}s", timeout_seconds);
+    }
+}
+
+pub async fn poll_icmp_socket(socket_fd: RawFd, expected_ip_id: u16) -> Result<Option<HopInfo>> {
+    // Receive ICMP packets using recvfrom. This is a blocking syscall;
+    // call it inside spawn_blocking so we don't block the Tokio reactor.
+    let result = tokio::task::spawn_blocking(move || {
+        eprintln!("[DEBUG poll_icmp_socket] Starting, fd={}, expecting IP ID={}", socket_fd, expected_ip_id);
+        
+        // First, check if the socket can receive anything at all
+        // Try a quick non-blocking peek
+        let mut test_buf = [0u8; 1];
+        let peek_result = unsafe {
+            libc::recv(socket_fd, test_buf.as_mut_ptr() as *mut c_void, 1, libc::MSG_DONTWAIT | libc::MSG_PEEK)
+        };
+        eprintln!("[DEBUG poll_icmp_socket] Non-blocking peek result: {} (errno: {:?})", 
+            peek_result, if peek_result < 0 { Some(std::io::Error::last_os_error()) } else { None });
+        
+        // Set a 2-second receive timeout
+        set_receive_timeout(socket_fd, 2);
+        
+        // Buffer for receiving ICMP packet + IP header
+        let mut receive_buffer = [0u8; PACKET_BUFFER_SIZE];
+        let mut src_addr: sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<sockaddr_in>() as u32;
+        
+        // Try multiple times to receive ICMP packets
+        // We may receive other ICMP packets (pings, etc.) before ours
+        // The timeout on the socket is 2s, so recvfrom will block waiting for packets
+        // We loop to handle receiving unrelated ICMP packets before ours arrives
+        const MAX_RECEIVE_ATTEMPTS: u32 = 20;
+        for attempt in 1..=MAX_RECEIVE_ATTEMPTS {
+            eprintln!("[DEBUG poll_icmp_socket] Attempt {} of {}", attempt, MAX_RECEIVE_ATTEMPTS);
+            
+            let bytes_received = unsafe {
+                recvfrom(
+                    socket_fd,
+                    receive_buffer.as_mut_ptr() as *mut c_void,
+                    receive_buffer.len(),
+                    0,
+                    &mut src_addr as *mut _ as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+            
+            if bytes_received < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut {
+                    eprintln!("[DEBUG poll_icmp_socket] Timeout waiting for ICMP (no packets received)");
+                    // Timeout means no ICMP packets arrived at all within 2s
+                    return Ok(None);
+                }
+                eprintln!("[DEBUG poll_icmp_socket] recvfrom error: {}", error);
+                return Err(error);
+            }
+            
+            let packet_size = bytes_received as usize;
+            eprintln!("[DEBUG poll_icmp_socket] Received {} bytes from link layer", packet_size);
+            
+            // Parse and check if this is our ICMP Time Exceeded response
+            if let Some((router_ip, mpls_labels)) = is_matching_icmp_time_exceeded(
+                &receive_buffer,
+                packet_size,
+                expected_ip_id,
+            ) {
+                return Ok(Some(HopInfo {
+                    router_ip: router_ip.to_string(),
+                    mpls_labels,
+                }));
+            }
+        }
+        
+        eprintln!("[DEBUG poll_icmp_socket] No matching ICMP Time Exceeded received");
         Ok(None)
     })
     .await?;
 
-    res.map_err(|e| anyhow!(e))
+    result.map_err(|e| anyhow!(e))
 }
 
 #[cfg(test)]
@@ -401,6 +594,5 @@ mod tests {
     #[test]
     fn test_socket_operations_exist() {
         // Just verify the module compiles
-        // Can't test actual socket operations without a real socket
     }
 }
