@@ -1,8 +1,8 @@
 use crate::events::event_bus;
-use crate::socket::{enable_ip_recverr, poll_errqueue, set_ip_ttl};
+use crate::socket::{create_raw_socket, enable_ip_recverr, poll_errqueue, send_tcp_probe};
 use crate::types::Hop;
 use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -47,18 +47,53 @@ pub async fn handle_client(
         &serde_json::json!({ "clientId": peer_id }),
     );
 
-    // Get the raw fd from the underlying TCP stream BEFORE splitting
+    // Get TCP connection details
     let tcp = ws.get_ref();
-    let fd = tcp.as_raw_fd();
+    let tcp_fd = tcp.as_raw_fd();
     
-    eprintln!("[DEBUG handler] WebSocket TCP socket fd={}", fd);
+    // Get local and remote addresses
+    let (local_addr, remote_addr) = unsafe {
+        let mut local: libc::sockaddr_storage = std::mem::zeroed();
+        let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
+        
+        let local_in = &*((&local) as *const _ as *const libc::sockaddr_in);
+        let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
+        let local_port = u16::from_be(local_in.sin_port);
+        
+        let remote_ip = match peer.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            _ => {
+                eprintln!("[DEBUG handler] IPv6 not supported");
+                return;
+            }
+        };
+        
+        ((local_ip, local_port), (remote_ip, peer.port()))
+    };
+    
+    eprintln!("[DEBUG handler] Connection: {}:{} -> {}:{}", 
+        local_addr.0, local_addr.1, remote_addr.0, remote_addr.1);
 
-    // Enable IP_RECVERR on the TCP socket to receive ICMP errors
-    if let Err(e) = enable_ip_recverr(fd) {
+    // Create raw socket for sending TCP probes
+    let raw_fd = match create_raw_socket() {
+        Ok(fd) => fd,
+        Err(e) => {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": peer_id, "message": format!("create raw socket failed: {}", e)}),
+            );
+            return;
+        }
+    };
+
+    // Enable IP_RECVERR on raw socket to receive ICMP errors
+    if let Err(e) = enable_ip_recverr(raw_fd) {
         event_bus().emit(
             "error",
             &serde_json::json!({"clientId": peer_id, "message": format!("IP_RECVERR enable failed: {}", e)}),
         );
+        unsafe { libc::close(raw_fd) };
         return;
     }
 
@@ -68,6 +103,10 @@ pub async fn handle_client(
     // Tracing task
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let peer_id_clone = peer_id.clone();
+    let seq_base = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() & 0xFFFFFFFF) as u32;
 
     let trace_task = tokio::spawn(async move {
         // Send a greeting
@@ -79,46 +118,35 @@ pub async fn handle_client(
         for ttl in 1..=max_hops {
             eprintln!("[DEBUG handler] === Starting hop TTL={} ===", ttl);
             
-            // Set TTL on the TCP socket for the next packet
-            if let Err(e) = set_ip_ttl(fd, ttl as i32) {
-                event_bus().emit(
-                    "error",
-                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("set TTL {} failed: {}", ttl, e)}),
-                );
-                break;
-            }
-            
-            // Send a WebSocket message that will trigger a TCP send
-            // We send actual data (not just ping) to ensure TCP transmits
+            // Send TCP probe packets with current TTL using raw socket
             let send_at = tokio::time::Instant::now();
-            let probe_msg = serde_json::json!({
-                "type": "probe",
-                "ttl": ttl,
-                "data": "x".repeat(100) // 100 bytes to ensure packet goes out
-            });
+            let seq = seq_base.wrapping_add(ttl as u32);
             
-            eprintln!("[DEBUG handler] Sending WebSocket probe message for TTL={}", ttl);
-            if let Err(e) = ws_writer.send(Message::Text(serde_json::to_string(&probe_msg).unwrap())).await {
-                event_bus().emit(
-                    "error",
-                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("send probe failed: {}", e)}),
-                );
-                break;
-            }
+            eprintln!("[DEBUG handler] Sending raw TCP probe for TTL={}", ttl);
+            let ip_id = match send_tcp_probe(
+                raw_fd,
+                local_addr.0,
+                remote_addr.0,
+                local_addr.1,
+                remote_addr.1,
+                seq,
+                ttl,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[DEBUG handler] Failed to send probe: {}", e);
+                    event_bus().emit(
+                        "error",
+                        &serde_json::json!({"clientId": peer_id_clone, "message": format!("send probe failed: {}", e)}),
+                    );
+                    break;
+                }
+            };
             
-            // CRITICAL: Flush to force immediate transmission
-            if let Err(e) = ws_writer.flush().await {
-                event_bus().emit(
-                    "error",
-                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("flush failed: {}", e)}),
-                );
-                break;
-            }
-            
-            eprintln!("[DEBUG handler] Message sent and flushed, waiting for ICMP response...");
+            eprintln!("[DEBUG handler] Probe sent (IP ID={}), waiting for ICMP response...", ip_id);
 
             // Poll kernel errqueue for Time Exceeded from the router for up to ttl_timeout
-            match timeout(ttl_timeout, async move { poll_errqueue(fd).await }).await {
+            match timeout(ttl_timeout, async move { poll_errqueue(raw_fd).await }).await {
                 Ok(Ok(Some(router))) => {
                     let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms", router, rtt_ms);
@@ -177,6 +205,10 @@ pub async fn handle_client(
         let _ = ws_writer
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
             .await;
+        
+        // Clean up raw socket
+        unsafe { libc::close(raw_fd) };
+        eprintln!("[DEBUG handler] Closed raw socket");
         
         let _ = done_tx.send(());
     });
