@@ -1,0 +1,37 @@
+{
+  "name": "ZeroTrace WebSocket (Debian)",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24"
+    },
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.checkOnSave.command": "clippy"
+      }
+    }
+  },
+
+  "postCreateCommand": "rustup component add clippy rustfmt && cargo build && npm install",
+
+  "forwardPorts": [3000, 8080],
+  
+  "remoteUser": "vscode",
+  
+  "mounts": [
+    "source=${localWorkspaceFolder}/target,target=${containerWorkspaceFolder}/target,type=bind,consistency=cached"
+  ]
+}

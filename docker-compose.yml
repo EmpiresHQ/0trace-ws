@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  zerotrace-ws:
+    image: ${DOCKER_REGISTRY}/zerotrace-ws:latest
+    container_name: zerotrace-ws
+    restart: unless-stopped
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.zerotrace.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.zerotrace.entrypoints=websecure"
+      - "traefik.http.routers.zerotrace.tls=true"
+      - "traefik.http.routers.zerotrace.tls.certresolver=letsencrypt"
+      - "traefik.http.services.zerotrace.loadbalancer.server.port=3000"
+      
+      # WebSocket route
+      - "traefik.http.routers.zerotrace-ws.rule=Host(`${DOMAIN}`) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.zerotrace-ws.entrypoints=websecure"
+      - "traefik.http.routers.zerotrace-ws.tls=true"
+      - "traefik.http.routers.zerotrace-ws.tls.certresolver=letsencrypt"
+      - "traefik.http.services.zerotrace-ws.loadbalancer.server.port=8080"
+    environment:
+      - NODE_ENV=production
+
+networks:
+  traefik:
+    external: true

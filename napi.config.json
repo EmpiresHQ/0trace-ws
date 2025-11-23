@@ -1,0 +1,6 @@
+{
+  "name": "zerotrace-ws",
+  "targets": ["node"],
+  "triples": null,
+  "type": "module"
+}

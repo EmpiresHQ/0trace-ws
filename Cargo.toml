@@ -1,0 +1,30 @@
+[package]
+name = "zerotrace-ws"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# N-API
+napi = { version = "2", features = ["napi5"] }
+napi-derive = "2"
+
+# Async stack
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+futures = "0.3"
+
+# WebSocket
+tokio-tungstenite = "0.23"
+tungstenite = { version = "0.21", default-features = false }
+
+# Utils
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+thiserror = "1"
+
+# Linux socket bits
+libc = "0.2"

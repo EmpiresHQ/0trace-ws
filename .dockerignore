@@ -1,0 +1,14 @@
+# Docker ignore file for zerotrace-ws
+node_modules
+target
+*.log
+.git
+.gitignore
+.devcontainer
+.vscode
+*.md
+!README.md
+test.ts
+demo.ts
+VALIDATION.md
+TYPESCRIPT.md
