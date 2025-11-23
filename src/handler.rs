@@ -220,25 +220,34 @@ pub async fn handle_client(
         
         // STEP 2: Collect ICMP responses for all probes
         // We listen for ICMP Time Exceeded messages and match them by IP ID
-        let mut received_hops = std::collections::HashSet::new();
-        let collection_deadline = tokio::time::Instant::now() + ttl_timeout * 3; // Give more time for all responses
+        let collection_deadline = tokio::time::Instant::now() + ttl_timeout * 3;
+        let total_probes = probe_map.len();
         
-        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline {
-            // Try to receive any ICMP response (we don't know which TTL will respond first)
-            // In 0trace, responses can come in any order
+        // We need to poll for ANY ICMP response, not specific IP IDs
+        // Use a loop that receives any ICMP packet and checks if it matches any of our probes
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
+        
+        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline && attempts < MAX_ATTEMPTS {
+            attempts += 1;
             
-            // Pick first remaining probe to wait for
-            if let Some((&ip_id, &(ttl, send_at))) = probe_map.iter().next() {
-                let remaining_time = collection_deadline.saturating_duration_since(tokio::time::Instant::now());
-                
-                match timeout(remaining_time, async move { poll_icmp_socket(icmp_fd, ip_id).await }).await {
+            // Receive ANY ICMP packet with a short timeout
+            // We'll use poll_icmp_socket in a special way - try each IP ID we're waiting for
+            // But actually we need to modify poll_icmp_socket to accept ANY matching packet
+            
+            // For now, iterate through all pending IP IDs and check each one with a very short timeout
+            let mut found_any = false;
+            let check_timeout = Duration::from_millis(50);
+            
+            for (&ip_id, &(ttl, send_at)) in probe_map.clone().iter() {
+                match timeout(check_timeout, poll_icmp_socket(icmp_fd, ip_id)).await {
                     Ok(Ok(Some(hop_info))) => {
+                        found_any = true;
                         probe_map.remove(&ip_id);
-                        received_hops.insert(ttl);
                         
                         let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
-                        eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms", 
-                            ttl, hop_info.router_ip, rtt_ms);
+                        eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms ({}/{} responses)", 
+                            ttl, hop_info.router_ip, rtt_ms, total_probes - probe_map.len(), total_probes);
                         
                         let hop = Hop {
                             client_id: peer_id_clone.clone(),
@@ -270,40 +279,35 @@ pub async fn handle_client(
                         let _ = ws_writer
                             .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
                             .await;
+                        
+                        break; // Found one, continue outer loop
                     }
                     Ok(Ok(None)) | Err(_) => {
-                        // No response or timeout for this probe
-                        probe_map.remove(&ip_id);
-                        eprintln!("[DEBUG handler] No response for TTL={}", ttl);
-                        
-                        let _ = ws_writer
-                            .send(Message::Text(format!(
-                                r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
-                                ttl
-                            )))
-                            .await;
+                        // No response yet for this IP ID, continue checking others
+                        continue;
                     }
-                    Ok(Err(e)) => {
-                        probe_map.remove(&ip_id);
-                        eprintln!("[DEBUG handler] Error for TTL={}: {}", ttl, e);
+                    Ok(Err(_e)) => {
+                        // Error for this probe, skip it
+                        continue;
                     }
                 }
-            } else {
-                break;
+            }
+            
+            // If we didn't find any responses in this iteration, wait a bit before trying again
+            if !found_any {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         
         // Report any probes that never got a response
-        for (ip_id, (ttl, _)) in probe_map {
-            if !received_hops.contains(&ttl) {
-                eprintln!("[DEBUG handler] Timeout for TTL={} (IP_ID={})", ttl, ip_id);
-                let _ = ws_writer
-                    .send(Message::Text(format!(
-                        r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
-                        ttl
-                    )))
-                    .await;
-            }
+        for (_ip_id, (ttl, _)) in probe_map {
+            eprintln!("[DEBUG handler] Timeout for TTL={}", ttl);
+            let _ = ws_writer
+                .send(Message::Text(format!(
+                    r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
+                    ttl
+                )))
+                .await;
         }
 
         let _ = ws_writer
