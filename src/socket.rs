@@ -61,7 +61,7 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
         msg.msg_iov = &mut iov as *mut iovec;
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_space.as_mut_ptr() as *mut c_void;
-        msg.msg_controllen = cmsg_space.len();
+        msg.msg_controllen = cmsg_space.len() as _;
         
         let rc = unsafe { recvmsg(fd, &mut msg as *mut msghdr, MSG_ERRQUEUE) };
         if rc < 0 {
