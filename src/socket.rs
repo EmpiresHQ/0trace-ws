@@ -49,6 +49,23 @@ pub fn set_ip_ttl(fd: RawFd, ttl: i32) -> Result<()> {
         eprintln!("[DEBUG set_ip_ttl] Failed: {}", e);
         return Err(e).map_err(|e| anyhow!(e));
     }
+    
+    // Verify TTL was set by reading it back
+    let mut read_ttl: i32 = 0;
+    let mut len: u32 = std::mem::size_of::<i32>() as u32;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_IP,
+            IP_TTL,
+            &mut read_ttl as *mut _ as *mut c_void,
+            &mut len as *mut u32,
+        )
+    };
+    if rc == 0 {
+        eprintln!("[DEBUG set_ip_ttl] Verified TTL readback: {}", read_ttl);
+    }
+    
     eprintln!("[DEBUG set_ip_ttl] Success");
     Ok(())
 }
@@ -62,7 +79,7 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
     let res = tokio::task::spawn_blocking(move || {
         eprintln!("[DEBUG poll_errqueue] Starting, fd={}", fd);
         
-        // Save original flags and set socket to blocking mode
+        // Save original flags and set socket to blocking mode with a receive timeout
         let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if orig_flags < 0 {
             eprintln!("[DEBUG poll_errqueue] Failed to get socket flags");
@@ -76,7 +93,26 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
             eprintln!("[DEBUG poll_errqueue] Failed to set blocking mode");
             return Err(std::io::Error::last_os_error());
         }
-        eprintln!("[DEBUG poll_errqueue] Socket set to blocking mode");
+        
+        // Set a receive timeout of 1 second on the socket
+        let timeout_val = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout_val as *const _ as *const c_void,
+                std::mem::size_of::<libc::timeval>() as u32,
+            )
+        };
+        if rc < 0 {
+            eprintln!("[DEBUG poll_errqueue] Failed to set SO_RCVTIMEO");
+        } else {
+            eprintln!("[DEBUG poll_errqueue] Socket set to blocking mode with 1s timeout");
+        }
         
         // Prepare structures inside the blocking task
         let mut cmsg_space = [0u8; 512];
@@ -105,8 +141,8 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
             let e = std::io::Error::last_os_error();
             eprintln!("[DEBUG poll_errqueue] recvmsg error: {} (kind: {:?})", e, e.kind());
             // EAGAIN/EWOULDBLOCK means no errqueue data
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                eprintln!("[DEBUG poll_errqueue] No data in error queue (EWOULDBLOCK)");
+            if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                eprintln!("[DEBUG poll_errqueue] No data in error queue (timeout/wouldblock)");
                 return Ok(None);
             }
             return Err(e);

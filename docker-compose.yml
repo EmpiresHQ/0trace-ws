@@ -27,6 +27,10 @@ services:
     image: ${DOCKER_REGISTRY}/zerotrace-ws:latest
     container_name: zerotrace-ws
     restart: unless-stopped
+    # Required for ICMP packet capture
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     logging:
       driver: "json-file"
       options:

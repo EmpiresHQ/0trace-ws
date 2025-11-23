@@ -47,22 +47,23 @@ pub async fn handle_client(
         &serde_json::json!({ "clientId": peer_id }),
     );
 
-    // Grab the underlying TCP fd before splitting
-    // We need to get the raw fd from the tokio TcpStream
+    // Get the raw fd from the underlying TCP stream BEFORE splitting
     let tcp = ws.get_ref();
     let fd = tcp.as_raw_fd();
+    
+    eprintln!("[DEBUG handler] WebSocket TCP socket fd={}", fd);
 
-    // Split so we can send/receive
-    let (mut ws_writer, mut ws_reader) = ws.split();
-
-    // Enable IP_RECVERR on this socket so ICMP Time Exceeded ends up in errqueue
+    // Enable IP_RECVERR on the TCP socket to receive ICMP errors
     if let Err(e) = enable_ip_recverr(fd) {
         event_bus().emit(
             "error",
             &serde_json::json!({"clientId": peer_id, "message": format!("IP_RECVERR enable failed: {}", e)}),
         );
-        // We proceed but will not get hop info
+        return;
     }
+
+    // Split WebSocket so we can send/receive
+    let (mut ws_writer, mut ws_reader) = ws.split();
 
     // Tracing task
     let (done_tx, done_rx) = oneshot::channel::<()>();
@@ -78,6 +79,7 @@ pub async fn handle_client(
         for ttl in 1..=max_hops {
             eprintln!("[DEBUG handler] === Starting hop TTL={} ===", ttl);
             
+            // Set TTL on the TCP socket for the next packet
             if let Err(e) = set_ip_ttl(fd, ttl as i32) {
                 event_bus().emit(
                     "error",
@@ -85,19 +87,26 @@ pub async fn handle_client(
                 );
                 break;
             }
-
-            // Send a tiny WS ping; this triggers one TCP segment at current TTL
+            
+            // Send a WebSocket message that will trigger a TCP send
+            // We send actual data (not just ping) to ensure TCP transmits
             let send_at = tokio::time::Instant::now();
-            eprintln!("[DEBUG handler] Sending WebSocket ping with payload [{}]", ttl);
-            if let Err(e) = ws_writer.send(Message::Ping(vec![ttl])).await {
+            let probe_msg = serde_json::json!({
+                "type": "probe",
+                "ttl": ttl,
+                "data": "x".repeat(100) // 100 bytes to ensure packet goes out
+            });
+            
+            eprintln!("[DEBUG handler] Sending WebSocket probe message for TTL={}", ttl);
+            if let Err(e) = ws_writer.send(Message::Text(serde_json::to_string(&probe_msg).unwrap())).await {
                 event_bus().emit(
                     "error",
-                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("send ping failed: {}", e)}),
+                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("send probe failed: {}", e)}),
                 );
                 break;
             }
             
-            // CRITICAL: Flush to ensure the packet is actually sent NOW
+            // CRITICAL: Flush to force immediate transmission
             if let Err(e) = ws_writer.flush().await {
                 event_bus().emit(
                     "error",
@@ -105,7 +114,8 @@ pub async fn handle_client(
                 );
                 break;
             }
-            eprintln!("[DEBUG handler] Ping sent and flushed, waiting for ICMP response...");
+            
+            eprintln!("[DEBUG handler] Message sent and flushed, waiting for ICMP response...");
 
             // Poll kernel errqueue for Time Exceeded from the router for up to ttl_timeout
             match timeout(ttl_timeout, async move { poll_errqueue(fd).await }).await {
@@ -167,6 +177,7 @@ pub async fn handle_client(
         let _ = ws_writer
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
             .await;
+        
         let _ = done_tx.send(());
     });
 
