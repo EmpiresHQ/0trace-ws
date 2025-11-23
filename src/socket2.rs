@@ -282,6 +282,7 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             // AF_PACKET gives us Ethernet frame: Ethernet header (14 bytes) + IP packet
             // Skip Ethernet header to get to IP header
             let eth_header_len = 14;
+            eprintln!("[DEBUG poll_icmp_socket] Checking packet size: {} >= {} ?", bytes_read, eth_header_len + 20);
             if bytes_read < eth_header_len + 20 {
                 eprintln!("[DEBUG poll_icmp_socket] Packet too small for Ethernet + IP header");
                 continue;
@@ -289,6 +290,7 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             
             // Check if this is an IP packet (EtherType 0x0800)
             let ethertype = u16::from_be_bytes([buf[12], buf[13]]);
+            eprintln!("[DEBUG poll_icmp_socket] EtherType=0x{:04x}", ethertype);
             if ethertype != 0x0800 {
                 eprintln!("[DEBUG poll_icmp_socket] Not an IP packet (ethertype=0x{:04x}), skipping", ethertype);
                 continue;
@@ -300,6 +302,7 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             
             // Check if this is ICMP (protocol 1)
             let ip_protocol = buf[ip_start + 9];
+            eprintln!("[DEBUG poll_icmp_socket] IP protocol={}", ip_protocol);
             if ip_protocol != 1 {  // 1 = ICMP
                 // Skip non-ICMP packets silently (too much noise)
                 continue;
