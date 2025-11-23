@@ -3,8 +3,8 @@ use std::os::fd::RawFd;
 use std::net::Ipv4Addr;
 use libc::{
     c_int, c_void, recvfrom, sendto, setsockopt,
-    sockaddr_in, socket, close, AF_INET, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_ICMP, SOCK_RAW,
-    IP_HDRINCL, SOL_IP,
+    sockaddr_in, socket, close, htons, AF_INET, AF_PACKET, IPPROTO_RAW, IPPROTO_TCP, SOCK_RAW,
+    IP_HDRINCL, SOL_IP, ETH_P_IP,
 };
 
 // ICMP constants
@@ -41,22 +41,42 @@ pub fn create_raw_socket() -> Result<RawFd> {
     Ok(fd)
 }
 
-/// Create a raw ICMP socket for receiving ICMP Time Exceeded messages
+/// Create a packet capture socket for receiving ICMP Time Exceeded messages
 /// 
-/// Unlike the raw IP socket used for sending, this socket receives ALL
-/// ICMP packets arriving at the host. We filter for Time Exceeded messages
-/// in userspace by parsing the ICMP payload.
+/// This creates an AF_PACKET socket which captures at the link layer,
+/// similar to how the Go implementation uses pcap. This is necessary because
+/// ICMP error messages (Time Exceeded) are not delivered to regular ICMP sockets -
+/// they're handled specially by the kernel and delivered via IP_RECVERR or
+/// visible only at the link layer.
 /// 
-/// This is the key difference from the MSG_ERRQUEUE approach - we create
-/// a separate socket specifically for receiving ICMP, similar to how the
-/// Go implementation uses pcap to capture ICMP packets.
-pub fn create_icmp_socket() -> Result<RawFd> {
-    let fd = unsafe { socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) };
+/// AF_PACKET socket receives ALL IP packets, so we filter in userspace.
+pub fn create_icmp_socket(_bind_addr: Option<Ipv4Addr>) -> Result<RawFd> {
+    // Create AF_PACKET socket to capture all IP packets at link layer
+    // This is like using pcap but with raw sockets
+    let fd = unsafe { socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP as u16) as i32) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).map_err(|e| anyhow!(e));
     }
     
-    eprintln!("[DEBUG create_icmp_socket] Created ICMP socket fd={}", fd);
+    // Note: AF_PACKET sockets don't bind to IP addresses, they bind to interfaces
+    // We'll receive all packets and filter by checking the IP addresses
+    
+    // Set receive buffer size to ensure we don't miss packets
+    let rcvbuf_size: c_int = 256 * 1024; // 256KB
+    let rc = unsafe {
+        setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf_size as *const _ as *const c_void,
+            std::mem::size_of::<c_int>() as u32,
+        )
+    };
+    if rc < 0 {
+        eprintln!("[DEBUG create_icmp_socket] Warning: Failed to set SO_RCVBUF");
+    }
+    
+    eprintln!("[DEBUG create_icmp_socket] Created AF_PACKET socket fd={} (link-layer capture)", fd);
     Ok(fd)
 }
 
@@ -192,6 +212,15 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
     let res = tokio::task::spawn_blocking(move || {
         eprintln!("[DEBUG poll_icmp_socket] Starting, fd={}, expecting IP ID={}", fd, expected_ip_id);
         
+        // First, check if the socket can receive anything at all
+        // Try a quick non-blocking peek
+        let mut test_buf = [0u8; 1];
+        let peek_rc = unsafe {
+            libc::recv(fd, test_buf.as_mut_ptr() as *mut c_void, 1, libc::MSG_DONTWAIT | libc::MSG_PEEK)
+        };
+        eprintln!("[DEBUG poll_icmp_socket] Non-blocking peek result: {} (errno: {:?})", 
+            peek_rc, if peek_rc < 0 { Some(std::io::Error::last_os_error()) } else { None });
+        
         // Set a 2-second receive timeout
         let timeout_val = libc::timeval {
             tv_sec: 2,
@@ -219,6 +248,8 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
         
         // Try multiple times to receive ICMP packets
         // We may receive other ICMP packets (pings, etc.) before ours
+        // The timeout on the socket is 2s, so recvfrom will block waiting for packets
+        // We loop to handle receiving unrelated ICMP packets before ours arrives
         let max_attempts = 20;
         for attempt in 1..=max_attempts {
             eprintln!("[DEBUG poll_icmp_socket] Attempt {} of {}", attempt, max_attempts);
@@ -237,35 +268,52 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             if rc < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
-                    eprintln!("[DEBUG poll_icmp_socket] Timeout on attempt {}", attempt);
-                    if attempt >= max_attempts {
-                        eprintln!("[DEBUG poll_icmp_socket] No ICMP received after {} attempts", max_attempts);
-                        return Ok(None);
-                    }
-                    continue;
+                    eprintln!("[DEBUG poll_icmp_socket] Timeout waiting for ICMP (no packets received)");
+                    // Timeout means no ICMP packets arrived at all within 2s
+                    return Ok(None);
                 }
                 eprintln!("[DEBUG poll_icmp_socket] recvfrom error: {}", e);
                 return Err(e);
             }
             
             let bytes_read = rc as usize;
-            eprintln!("[DEBUG poll_icmp_socket] Received {} bytes", bytes_read);
+            eprintln!("[DEBUG poll_icmp_socket] Received {} bytes from link layer", bytes_read);
             
-            // Parse IP header (first 20+ bytes)
-            if bytes_read < 20 {
-                eprintln!("[DEBUG poll_icmp_socket] Packet too small for IP header");
+            // AF_PACKET gives us Ethernet frame: Ethernet header (14 bytes) + IP packet
+            // Skip Ethernet header to get to IP header
+            let eth_header_len = 14;
+            if bytes_read < eth_header_len + 20 {
+                eprintln!("[DEBUG poll_icmp_socket] Packet too small for Ethernet + IP header");
                 continue;
             }
             
-            let ip_header_len = ((buf[0] & 0x0F) * 4) as usize;
-            if bytes_read < ip_header_len + 8 {
+            // Check if this is an IP packet (EtherType 0x0800)
+            let ethertype = u16::from_be_bytes([buf[12], buf[13]]);
+            if ethertype != 0x0800 {
+                eprintln!("[DEBUG poll_icmp_socket] Not an IP packet (ethertype=0x{:04x}), skipping", ethertype);
+                continue;
+            }
+            
+            // IP header starts after Ethernet header
+            let ip_start = eth_header_len;
+            let ip_header_len = ((buf[ip_start] & 0x0F) * 4) as usize;
+            
+            // Check if this is ICMP (protocol 1)
+            let ip_protocol = buf[ip_start + 9];
+            if ip_protocol != 1 {  // 1 = ICMP
+                // Skip non-ICMP packets silently (too much noise)
+                continue;
+            }
+            
+            if bytes_read < ip_start + ip_header_len + 8 {
                 eprintln!("[DEBUG poll_icmp_socket] Packet too small for ICMP header");
                 continue;
             }
             
             // ICMP header starts after IP header
-            let icmp_type = buf[ip_header_len];
-            let icmp_code = buf[ip_header_len + 1];
+            let icmp_start = ip_start + ip_header_len;
+            let icmp_type = buf[icmp_start];
+            let icmp_code = buf[icmp_start + 1];
             
             eprintln!("[DEBUG poll_icmp_socket] ICMP type={}, code={}", icmp_type, icmp_code);
             
@@ -276,8 +324,8 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             }
             
             // ICMP Time Exceeded contains the original IP header in its payload
-            // Format: IP header (20) + ICMP header (8) + original IP header (20+) + original TCP header...
-            let orig_ip_offset = ip_header_len + 8;
+            // Format: Ethernet (14) + IP header (20) + ICMP header (8) + original IP header (20+) + original TCP header...
+            let orig_ip_offset = icmp_start + 8;
             if bytes_read < orig_ip_offset + 20 {
                 eprintln!("[DEBUG poll_icmp_socket] No original IP header in ICMP payload");
                 continue;
@@ -289,7 +337,14 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             
             // Check if this ICMP is in response to our probe
             if orig_ip_id == expected_ip_id {
-                let router_ip = std::net::Ipv4Addr::from(u32::from_be(src_addr.sin_addr.s_addr));
+                // Extract router IP from the outer IP header's source address
+                let router_ip_bytes = &buf[ip_start + 12..ip_start + 16];
+                let router_ip = std::net::Ipv4Addr::new(
+                    router_ip_bytes[0],
+                    router_ip_bytes[1],
+                    router_ip_bytes[2],
+                    router_ip_bytes[3]
+                );
                 eprintln!("[DEBUG poll_icmp_socket] Match! Router IP: {}", router_ip);
                 return Ok(Some(router_ip.to_string()));
             } else {

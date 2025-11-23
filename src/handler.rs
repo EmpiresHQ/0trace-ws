@@ -109,7 +109,7 @@ pub async fn handle_client(
     // Unlike MSG_ERRQUEUE approach, we create a separate socket that receives
     // ALL ICMP packets, then filter for Time Exceeded messages matching our IP IDs
     // This is similar to how the Go implementation uses pcap to capture ICMP
-    let icmp_fd = match create_icmp_socket() {
+    let icmp_fd = match create_icmp_socket(Some(local_addr.0)) {
         Ok(fd) => fd,
         Err(e) => {
             event_bus().emit(
