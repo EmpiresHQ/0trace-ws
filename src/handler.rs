@@ -100,14 +100,15 @@ pub async fn handle_client(
         let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
         let local_port = u16::from_be(local_in.sin_port);
         
-        // Use real client IP from headers if available, otherwise fall back to peer
+        // ALWAYS use real client IP from headers (required behind proxy like Traefik)
         let remote_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
             eprintln!("[DEBUG handler] Using real client IP from headers: {}", real_ip);
             real_ip
         } else {
+            eprintln!("[DEBUG handler] No X-Forwarded-For or X-Real-IP header found!");
             match peer.ip() {
                 std::net::IpAddr::V4(ip) => {
-                    eprintln!("[DEBUG handler] Using peer IP: {}", ip);
+                    eprintln!("[DEBUG handler] Falling back to peer IP: {} (WARNING: this is likely the proxy!)", ip);
                     ip
                 },
                 _ => {
@@ -116,17 +117,12 @@ pub async fn handle_client(
                 }
             }
         };
-        let remote_port = peer.port();
         
-        // FOR TESTING: If client is on local network, trace to 8.8.8.8 instead
-        let (target_ip, target_port) = if remote_ip.is_private() || remote_ip.is_loopback() {
-            eprintln!("[DEBUG handler] Client {} is local, tracing to 8.8.8.8 for testing", remote_ip);
-            (Ipv4Addr::new(8, 8, 8, 8), 53)
-        } else {
-            (remote_ip, remote_port)
-        };
+        // For traceroute, we use arbitrary port (doesn't matter much)
+        // The important part is the IP address
+        let remote_port = 80;
         
-        ((local_ip, local_port), (target_ip, target_port))
+        ((local_ip, local_port), (remote_ip, remote_port))
     };
     
     eprintln!("[DEBUG handler] Tracing path: Server {}:{} -> Client {}:{}", 
