@@ -1,6 +1,22 @@
 use serde::Serialize;
 use napi_derive::napi;
 
+/// Information about packet modifications detected in ICMP response
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketModifications {
+    /// TTL was modified (decreased more than expected)
+    pub ttl_modified: bool,
+    /// IP flags were modified
+    pub flags_modified: bool,
+    /// IP options were stripped
+    pub options_stripped: bool,
+    /// TCP flags were modified
+    pub tcp_flags_modified: bool,
+    /// Description of modifications
+    pub modifications: Vec<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Hop {
@@ -8,6 +24,8 @@ pub struct Hop {
     pub ttl: u8,
     pub router: String,
     pub rtt_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifications: Option<PacketModifications>,
 }
 
 #[derive(Clone)]

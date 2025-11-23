@@ -304,6 +304,49 @@
             margin-bottom: 10px;
         }
 
+        .modifications {
+            margin-top: 10px;
+            padding: 10px;
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            border-radius: 4px;
+        }
+
+        .modifications-title {
+            font-weight: 700;
+            color: #856404;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+        }
+
+        .modification-item {
+            font-size: 0.85em;
+            color: #856404;
+            margin-left: 15px;
+            padding: 2px 0;
+        }
+
+        .modification-item:before {
+            content: "⚠️ ";
+            margin-right: 5px;
+        }
+
+        .modification-flags {
+            display: flex;
+            gap: 8px;
+            margin-top: 5px;
+            flex-wrap: wrap;
+        }
+
+        .modification-flag {
+            background: #fff;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 0.8em;
+            font-weight: 600;
+            color: #856404;
+        }
+
         ::-webkit-scrollbar {
             width: 8px;
         }
@@ -466,6 +509,28 @@
                         </div>
                         ` : ''}
                     </div>
+                    ${hop.modifications && (
+                        hop.modifications.ttl_modified || 
+                        hop.modifications.flags_modified || 
+                        hop.modifications.options_stripped || 
+                        hop.modifications.tcp_flags_modified ||
+                        (hop.modifications.modifications && hop.modifications.modifications.length > 0)
+                    ) ? `
+                    <div class="modifications">
+                        <div class="modifications-title">🔍 Packet Modifications Detected (tracebox-style)</div>
+                        <div class="modification-flags">
+                            ${hop.modifications.ttl_modified ? '<span class="modification-flag">TTL Modified</span>' : ''}
+                            ${hop.modifications.flags_modified ? '<span class="modification-flag">IP Flags Modified</span>' : ''}
+                            ${hop.modifications.options_stripped ? '<span class="modification-flag">Options Stripped</span>' : ''}
+                            ${hop.modifications.tcp_flags_modified ? '<span class="modification-flag">TCP Flags Modified</span>' : ''}
+                        </div>
+                        ${hop.modifications.modifications && hop.modifications.modifications.length > 0 ? `
+                        <div style="margin-top: 8px;">
+                            ${hop.modifications.modifications.map(mod => `<div class="modification-item">${mod}</div>`).join('')}
+                        </div>
+                        ` : ''}
+                    </div>
+                    ` : ''}
                 </div>
             `).join('');
 

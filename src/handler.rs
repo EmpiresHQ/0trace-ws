@@ -232,8 +232,11 @@ pub async fn handle_client(
         let total_probes = probe_map.len();
         
         while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline {
-            // Build set of all IP IDs we're still waiting for
-            let expected_ids: std::collections::HashSet<u16> = probe_map.keys().copied().collect();
+            // Build map of all IP IDs -> TTL we're still waiting for
+            let expected_ids: std::collections::HashMap<u16, u8> = probe_map
+                .iter()
+                .map(|(ip_id, (ttl, _))| (*ip_id, *ttl))
+                .collect();
             
             let remaining_time_ms = collection_deadline
                 .saturating_duration_since(tokio::time::Instant::now())
@@ -253,16 +256,28 @@ pub async fn handle_client(
                         eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms ({}/{} responses)", 
                             ttl, hop_info.router_ip, rtt_ms, total_probes - probe_map.len(), total_probes);
                         
+                        // Prepare modifications for JSON (only if any were detected)
+                        let modifications_opt = if hop_info.modifications.ttl_modified 
+                            || hop_info.modifications.flags_modified 
+                            || hop_info.modifications.options_stripped 
+                            || hop_info.modifications.tcp_flags_modified 
+                            || !hop_info.modifications.modifications.is_empty() {
+                            Some(hop_info.modifications.clone())
+                        } else {
+                            None
+                        };
+                        
                         let hop = Hop {
                             client_id: peer_id_clone.clone(),
                             ttl,
                             router: hop_info.router_ip.clone(),
                             rtt_ms,
+                            modifications: modifications_opt.clone(),
                         };
                         let payload = serde_json::to_value(&hop).unwrap();
                         event_bus().emit("hop", &payload);
                         
-                        // Send hop to client with MPLS labels
+                        // Send hop to client with MPLS labels and packet modifications
                         let mpls_json: Vec<serde_json::Value> = hop_info.mpls_labels.iter().map(|l| {
                             serde_json::json!({
                                 "label": l.label,
@@ -271,6 +286,18 @@ pub async fn handle_client(
                             })
                         }).collect();
                         
+                        let modifications_json = if let Some(ref mods) = modifications_opt {
+                            serde_json::json!({
+                                "ttl_modified": mods.ttl_modified,
+                                "flags_modified": mods.flags_modified,
+                                "options_stripped": mods.options_stripped,
+                                "tcp_flags_modified": mods.tcp_flags_modified,
+                                "modifications": mods.modifications
+                            })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        
                         let hop_msg = serde_json::json!({
                             "type": "hop",
                             "clientId": peer_id_clone.clone(),
@@ -278,7 +305,8 @@ pub async fn handle_client(
                             "ip": hop_info.router_ip,
                             "router": hop_info.router_ip,
                             "rtt_ms": rtt_ms,
-                            "mpls": mpls_json
+                            "mpls": mpls_json,
+                            "modifications": modifications_json
                         });
                         let _ = ws_writer
                             .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
