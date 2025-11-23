@@ -51,7 +51,6 @@ services:
       - "traefik.docker.network=web"
     environment:
       - NODE_ENV=production
-      - SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP:-0.0.0.0}
 
 networks:
   web:

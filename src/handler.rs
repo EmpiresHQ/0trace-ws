@@ -88,7 +88,7 @@ pub async fn handle_client(
     let tcp = ws.get_ref();
     let tcp_fd = tcp.as_raw_fd();
     
-    // Get the actual WebSocket connection parameters
+    // Get the actual WebSocket connection parameters (as seen from inside container)
     let (ws_local_addr, ws_peer_addr) = unsafe {
         let mut local: libc::sockaddr_storage = std::mem::zeroed();
         let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
@@ -112,17 +112,6 @@ pub async fn handle_client(
     eprintln!("[DEBUG handler] WebSocket connection: {}:{} <-> {}:{}", 
         ws_local_addr.0, ws_local_addr.1, ws_peer_addr.0, ws_peer_addr.1);
     
-    // Get server's public IP for crafting packets
-    let server_public_ip = std::env::var("SERVER_PUBLIC_IP")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or_else(|| {
-            eprintln!("[DEBUG handler] SERVER_PUBLIC_IP not set, using WebSocket local IP");
-            ws_local_addr.0
-        });
-    
-    eprintln!("[DEBUG handler] Using source IP: {}", server_public_ip);
-    
     // Get REAL client IP from headers (required behind proxy like Traefik)
     let real_client_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
         eprintln!("[DEBUG handler] Real client IP from headers: {}", real_ip);
@@ -141,9 +130,12 @@ pub async fn handle_client(
         }
     };
     
-    // For 0trace: mimic existing connection but with real client IP as destination
-    // Use server's public IP as source, arbitrary port (since we craft the whole packet)
-    let trace_params = (server_public_ip, 54321u16, real_client_ip, 443u16);
+    // 0trace approach: Use ACTUAL WebSocket connection source (container IP:port)
+    // and trace to REAL client IP. This works because:
+    // 1. Packets are sent from container (same source as WebSocket)
+    // 2. ICMP replies will be routed back to container
+    // 3. We send all probes at once (0trace speed)
+    let trace_params = (ws_local_addr.0, ws_local_addr.1, real_client_ip, 443u16);
     
     eprintln!("[DEBUG handler] Trace packets: {}:{} -> {}:{}", 
         trace_params.0, trace_params.1, trace_params.2, trace_params.3);
