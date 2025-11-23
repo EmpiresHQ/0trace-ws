@@ -6,9 +6,6 @@
   "scripts": {
     "build": "napi build --release",
     "dev": "napi build --debug",
-    "test": "node --experimental-strip-types --test test.ts",
-    "demo": "node --experimental-strip-types demo.ts",
-    "start": "node --experimental-strip-types server.ts",
     "start:http": "node --experimental-strip-types http-server.ts",
     "start:ws": "node --experimental-strip-types ws-server.ts"
   },
