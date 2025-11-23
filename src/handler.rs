@@ -92,11 +92,25 @@ pub async fn handle_client(
     let (ws_local_addr, ws_peer_addr) = unsafe {
         let mut local: libc::sockaddr_storage = std::mem::zeroed();
         let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
+        let ret = libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
+        if ret != 0 {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": peer_id, "message": "getsockname failed"}),
+            );
+            return;
+        }
         
         let mut peer: libc::sockaddr_storage = std::mem::zeroed();
         let mut peer_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        libc::getpeername(tcp_fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut peer_len);
+        let ret = libc::getpeername(tcp_fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut peer_len);
+        if ret != 0 {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": peer_id, "message": "getpeername failed"}),
+            );
+            return;
+        }
         
         let local_in = &*((&local) as *const _ as *const libc::sockaddr_in);
         let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
@@ -170,13 +184,29 @@ pub async fn handle_client(
         }
     };
 
+    // Ensure sockets are cleaned up on all exit paths
+    let raw_fd_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(raw_fd)));
+    let icmp_fd_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(icmp_fd)));
+    let raw_fd_cleanup = raw_fd_arc.clone();
+    let icmp_fd_cleanup = icmp_fd_arc.clone();
+
     // Split WebSocket so we can send/receive
     let (mut ws_writer, mut ws_reader) = ws.split();
 
     // Send greeting
-    let _ = ws_writer
+    if let Err(e) = ws_writer
         .send(Message::Text(r#"{"type":"connected","message":"Trace started automatically"}"#.into()))
-        .await;
+        .await {
+        eprintln!("[DEBUG handler] Failed to send greeting: {}", e);
+        // Clean up sockets before returning
+        if let Some(fd) = raw_fd_cleanup.lock().unwrap().take() {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(fd) = icmp_fd_cleanup.lock().unwrap().take() {
+            unsafe { libc::close(fd); }
+        }
+        return;
+    }
 
     // 0trace approach: Send ALL probe packets immediately, then collect ICMP responses
     // This is the key difference from traditional traceroute which sends one packet,
@@ -191,13 +221,28 @@ pub async fn handle_client(
         .unwrap()
         .as_secs() & 0xFFFFFFFF) as u32;
 
+    
     let trace_task = tokio::spawn(async move {
         // Map to track IP IDs -> (TTL, send_time)
         let mut probe_map = std::collections::HashMap::new();
         
-        eprintln!("[DEBUG handler] === 0trace: Sending ALL probes (TTL 1-{}) ===", max_hops);
+        // Get the fd values from the Arc/Mutex
+        let raw_fd = match *raw_fd_arc.lock().unwrap() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("[DEBUG handler] Raw socket already closed");
+                return;
+            }
+        };
+        let icmp_fd = match *icmp_fd_arc.lock().unwrap() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("[DEBUG handler] ICMP socket already closed");
+                return;
+            }
+        };
         
-        // STEP 1: Send all probe packets at once (0trace technique)
+        eprintln!("[DEBUG handler] === 0trace: Sending ALL probes (TTL 1-{}) ===", max_hops);        // STEP 1: Send all probe packets at once (0trace technique)
         for ttl in 1..=max_hops {
             let seq = seq_base.wrapping_add(ttl as u32);
             let send_at = tokio::time::Instant::now();
@@ -338,12 +383,15 @@ pub async fn handle_client(
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
             .await;
         
-        // Clean up sockets
-        unsafe { 
-            libc::close(raw_fd);
-            libc::close(icmp_fd);
-        };
-        eprintln!("[DEBUG handler] Closed raw and ICMP sockets");
+        // Clean up sockets - take ownership from Arc to ensure proper cleanup
+        if let Some(fd) = raw_fd_arc.lock().unwrap().take() {
+            unsafe { libc::close(fd); }
+            eprintln!("[DEBUG handler] Closed raw socket");
+        }
+        if let Some(fd) = icmp_fd_arc.lock().unwrap().take() {
+            unsafe { libc::close(fd); }
+            eprintln!("[DEBUG handler] Closed ICMP socket");
+        }
         
         let _ = done_tx.send(());
     });
@@ -377,6 +425,16 @@ pub async fn handle_client(
     let _ = done_rx.await;
     let _ = trace_task.await;
     let _ = read_task.await;
+
+    // Final cleanup - ensure sockets are closed even if tasks failed
+    if let Some(fd) = raw_fd_cleanup.lock().unwrap().take() {
+        unsafe { libc::close(fd); }
+        eprintln!("[DEBUG handler] Final cleanup: closed raw socket");
+    }
+    if let Some(fd) = icmp_fd_cleanup.lock().unwrap().take() {
+        unsafe { libc::close(fd); }
+        eprintln!("[DEBUG handler] Final cleanup: closed ICMP socket");
+    }
 
     event_bus().emit("clientDone", &serde_json::json!({ "clientId": peer_id }));
 }

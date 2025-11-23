@@ -422,8 +422,10 @@ pub async fn poll_icmp_any(
     let result = tokio::task::spawn_blocking(move || {
         eprintln!("[DEBUG poll_icmp_any] Waiting for ICMP matching any of {} IP IDs", expected_map.len());
         
-        // Set receive timeout
-        set_receive_timeout(socket_fd, (timeout_ms / 1000) as i64);
+        // Set receive timeout - convert milliseconds to seconds and microseconds
+        let timeout_seconds = (timeout_ms / 1000) as i64;
+        let timeout_microseconds = ((timeout_ms % 1000) * 1000) as i64;
+        set_receive_timeout(socket_fd, timeout_seconds, timeout_microseconds);
         
         let mut receive_buffer = [0u8; PACKET_BUFFER_SIZE];
         let mut src_addr: sockaddr_in = unsafe { std::mem::zeroed() };
@@ -632,10 +634,10 @@ fn parse_icmp_time_exceeded(
 /// This approach is similar to the Go implementation which uses pcap - we
 /// capture ICMP packets and match them by IP ID in the embedded original packet.
 /// Set socket receive timeout
-fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64) {
+fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64, timeout_microseconds: i64) {
     let timeout_val = libc::timeval {
         tv_sec: timeout_seconds,
-        tv_usec: 0,
+        tv_usec: timeout_microseconds,
     };
     let result = unsafe {
         libc::setsockopt(
@@ -649,7 +651,7 @@ fn set_receive_timeout(socket_fd: RawFd, timeout_seconds: i64) {
     if result < 0 {
         eprintln!("[DEBUG] Failed to set SO_RCVTIMEO");
     } else {
-        eprintln!("[DEBUG] Socket timeout set to {}s", timeout_seconds);
+        eprintln!("[DEBUG] Socket timeout set to {}.{:06}s", timeout_seconds, timeout_microseconds);
     }
 }
 
