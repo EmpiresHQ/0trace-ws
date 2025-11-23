@@ -212,6 +212,12 @@
             animation: slideIn 0.3s ease-out;
         }
 
+        .hop-card.timeout {
+            background: #fff8e1;
+            border-left: 4px solid #ffc107;
+            opacity: 0.85;
+        }
+
         @keyframes slideIn {
             from {
                 opacity: 0;
@@ -480,19 +486,25 @@
             }
 
             hopsContainer.innerHTML = hops.map((hop, index) => `
-                <div class="hop-card">
+                <div class="hop-card ${hop.timeout ? 'timeout' : ''}">
                     <div class="hop-header">
                         <span class="hop-number">Hop #${index + 1}</span>
                         <span class="hop-ttl">TTL: ${hop.ttl}</span>
                     </div>
                     <div class="hop-details">
+                        ${hop.timeout ? `
+                        <div class="hop-detail" style="grid-column: 1 / -1;">
+                            <span class="detail-label">Status:</span>
+                            <span class="detail-value" style="color: #ffc107;">⏱ Request Timeout</span>
+                        </div>
+                        ` : `
                         <div class="hop-detail">
                             <span class="detail-label">IP:</span>
-                            <span class="detail-value">${hop.ip}</span>
+                            <span class="detail-value">${hop.ip || hop.router || 'Unknown'}</span>
                         </div>
                         <div class="hop-detail">
                             <span class="detail-label">RTT:</span>
-                            <span class="detail-value">${hop.rtt_ms.toFixed(2)} ms</span>
+                            <span class="detail-value">${hop.rtt_ms ? hop.rtt_ms.toFixed(2) + ' ms' : 'N/A'}</span>
                         </div>
                         ${hop.hostname ? `
                         <div class="hop-detail">
@@ -508,6 +520,7 @@
                             </span>
                         </div>
                         ` : ''}
+                        `}
                     </div>
                     ${hop.modifications && (
                         hop.modifications.ttl_modified || 
