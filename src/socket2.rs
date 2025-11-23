@@ -338,16 +338,18 @@ pub async fn poll_icmp_socket(fd: RawFd, expected_ip_id: u16) -> Result<Option<S
             let orig_ip_id = u16::from_be_bytes([buf[orig_ip_offset + 4], buf[orig_ip_offset + 5]]);
             eprintln!("[DEBUG poll_icmp_socket] Original packet IP ID: {}, expected: {}", orig_ip_id, expected_ip_id);
             
+            // Extract router IP from the outer IP header's source address
+            let router_ip_bytes = &buf[ip_start + 12..ip_start + 16];
+            let router_ip = std::net::Ipv4Addr::new(
+                router_ip_bytes[0],
+                router_ip_bytes[1],
+                router_ip_bytes[2],
+                router_ip_bytes[3]
+            );
+            eprintln!("[DEBUG poll_icmp_socket] ICMP from router: {}", router_ip);
+            
             // Check if this ICMP is in response to our probe
             if orig_ip_id == expected_ip_id {
-                // Extract router IP from the outer IP header's source address
-                let router_ip_bytes = &buf[ip_start + 12..ip_start + 16];
-                let router_ip = std::net::Ipv4Addr::new(
-                    router_ip_bytes[0],
-                    router_ip_bytes[1],
-                    router_ip_bytes[2],
-                    router_ip_bytes[3]
-                );
                 eprintln!("[DEBUG poll_icmp_socket] Match! Router IP: {}", router_ip);
                 return Ok(Some(router_ip.to_string()));
             } else {
