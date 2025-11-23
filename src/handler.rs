@@ -77,7 +77,7 @@ pub async fn handle_client(
         let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
         let local_port = u16::from_be(local_in.sin_port);
         
-        let remote_ip = match peer.ip() {
+        let _remote_ip = match peer.ip() {
             std::net::IpAddr::V4(ip) => ip,
             _ => {
                 eprintln!("[DEBUG handler] IPv6 not supported");
@@ -85,7 +85,12 @@ pub async fn handle_client(
             }
         };
         
-        ((local_ip, local_port), (remote_ip, peer.port()))
+        // For now, hardcode target to 8.8.8.8:80 (Google DNS) for testing
+        // TODO: Accept target from WebSocket message
+        let target_ip = Ipv4Addr::new(8, 8, 8, 8);
+        let target_port = 80;
+        
+        ((local_ip, local_port), (target_ip, target_port))
     };
     
     eprintln!("[DEBUG handler] Connection: {}:{} -> {}:{}", 
@@ -256,10 +261,22 @@ pub async fn handle_client(
         let _ = done_tx.send(());
     });
 
-    // Consume client messages (optional: keepalive / pong reading)
+    // Wait for client to send start message with target
     let read_task = tokio::spawn(async move {
         while let Some(msg) = ws_reader.next().await {
             match msg {
+                Ok(Message::Text(text)) => {
+                    eprintln!("[DEBUG handler] Received message: {}", text);
+                    // Expected format: {"target":"8.8.8.8","port":80}
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let (Some(target), Some(port)) = (json.get("target"), json.get("port")) {
+                            if let (Some(target_str), Some(port_num)) = (target.as_str(), port.as_u64()) {
+                                eprintln!("[DEBUG handler] Got target: {}:{}", target_str, port_num);
+                                // TODO: Send this to trace_task via channel
+                            }
+                        }
+                    }
+                }
                 Ok(Message::Pong(_)) => {
                     // ignore; tungstenite handles pings/pongs
                 }
