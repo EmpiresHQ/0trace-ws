@@ -76,6 +76,8 @@ pub async fn handle_client(
 
         // Walk TTL from 1..=max_hops
         for ttl in 1..=max_hops {
+            eprintln!("[DEBUG handler] === Starting hop TTL={} ===", ttl);
+            
             if let Err(e) = set_ip_ttl(fd, ttl as i32) {
                 event_bus().emit(
                     "error",
@@ -86,6 +88,7 @@ pub async fn handle_client(
 
             // Send a tiny WS ping; this triggers one TCP segment at current TTL
             let send_at = tokio::time::Instant::now();
+            eprintln!("[DEBUG handler] Sending WebSocket ping with payload [{}]", ttl);
             if let Err(e) = ws_writer.send(Message::Ping(vec![ttl])).await {
                 event_bus().emit(
                     "error",
@@ -93,11 +96,22 @@ pub async fn handle_client(
                 );
                 break;
             }
+            
+            // CRITICAL: Flush to ensure the packet is actually sent NOW
+            if let Err(e) = ws_writer.flush().await {
+                event_bus().emit(
+                    "error",
+                    &serde_json::json!({"clientId": peer_id_clone, "message": format!("flush failed: {}", e)}),
+                );
+                break;
+            }
+            eprintln!("[DEBUG handler] Ping sent and flushed, waiting for ICMP response...");
 
             // Poll kernel errqueue for Time Exceeded from the router for up to ttl_timeout
             match timeout(ttl_timeout, async move { poll_errqueue(fd).await }).await {
                 Ok(Ok(Some(router))) => {
                     let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms", router, rtt_ms);
                     let hop = Hop {
                         client_id: peer_id_clone.clone(),
                         ttl,
@@ -120,6 +134,7 @@ pub async fn handle_client(
                         .await;
                 }
                 Ok(Ok(None)) => {
+                    eprintln!("[DEBUG handler] No ICMP response (poll_errqueue returned None)");
                     // No ICMP; maybe reached destination (no Time Exceeded), or filtered.
                     let _ = ws_writer
                         .send(Message::Text(format!(
@@ -129,6 +144,7 @@ pub async fn handle_client(
                         .await;
                 }
                 Ok(Err(e)) => {
+                    eprintln!("[DEBUG handler] Error reading errqueue: {}", e);
                     event_bus().emit(
                         "error",
                         &serde_json::json!({"clientId": peer_id_clone, "message": format!("errqueue read error: {}", e)}),
@@ -136,6 +152,7 @@ pub async fn handle_client(
                     break;
                 }
                 Err(_) => {
+                    eprintln!("[DEBUG handler] Timeout waiting for ICMP");
                     // timeout
                     let _ = ws_writer
                         .send(Message::Text(format!(
