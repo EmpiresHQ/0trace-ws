@@ -47,6 +47,18 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
     // call it inside spawn_blocking so we don't block the Tokio reactor.
     // All structures must be created inside to avoid Send issues with raw pointers
     let res = tokio::task::spawn_blocking(move || {
+        // Save original flags and set socket to blocking mode
+        let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if orig_flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        
+        // Set to blocking (remove O_NONBLOCK)
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags & !libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        
         // Prepare structures inside the blocking task
         let mut cmsg_space = [0u8; 512];
         let mut data_buf = [0u8; 1];
@@ -64,6 +76,10 @@ pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
         msg.msg_controllen = cmsg_space.len() as _;
         
         let rc = unsafe { recvmsg(fd, &mut msg as *mut msghdr, MSG_ERRQUEUE) };
+        
+        // Restore original flags before returning
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
+        
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             // EAGAIN/EWOULDBLOCK means no errqueue data
