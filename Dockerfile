@@ -52,8 +52,12 @@ COPY --from=builder /app/index.d.ts ./
 COPY --from=builder /app/*.ts ./
 COPY --from=builder /app/public ./public
 
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Expose ports
 EXPOSE 3000 8080
 
-# Run the server
-CMD ["node", "--experimental-strip-types", "server.ts"]
+# Run the server with entrypoint script
+CMD ["/entrypoint.sh"]
