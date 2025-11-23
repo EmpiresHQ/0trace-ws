@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 use std::net::Ipv4Addr;
 use libc::{
     c_int, c_void, recvfrom, sendto, setsockopt,
-    sockaddr_in, socket, close, htons, AF_INET, AF_PACKET, IPPROTO_RAW, IPPROTO_TCP, SOCK_RAW,
+    sockaddr_in, sockaddr_ll, socket, close, htons, bind, if_nametoindex, AF_INET, AF_PACKET, IPPROTO_RAW, IPPROTO_TCP, SOCK_RAW,
     IP_HDRINCL, SOL_IP, ETH_P_IP,
 };
 
@@ -58,8 +58,32 @@ pub fn create_icmp_socket(_bind_addr: Option<Ipv4Addr>) -> Result<RawFd> {
         return Err(std::io::Error::last_os_error()).map_err(|e| anyhow!(e));
     }
     
-    // Note: AF_PACKET sockets don't bind to IP addresses, they bind to interfaces
-    // We'll receive all packets and filter by checking the IP addresses
+    // Bind to eth0 interface (the main network interface in the container)
+    // AF_PACKET sockets must be bound to a specific interface
+    let ifname = b"eth0\0";
+    let ifindex = unsafe { if_nametoindex(ifname.as_ptr() as *const libc::c_char) };
+    if ifindex == 0 {
+        eprintln!("[DEBUG create_icmp_socket] Warning: Could not find eth0 interface, will receive from all");
+    } else {
+        let mut sll: sockaddr_ll = unsafe { std::mem::zeroed() };
+        sll.sll_family = AF_PACKET as u16;
+        sll.sll_protocol = htons(ETH_P_IP as u16);
+        sll.sll_ifindex = ifindex as i32;
+        
+        let rc = unsafe {
+            bind(
+                fd,
+                &sll as *const sockaddr_ll as *const libc::sockaddr,
+                std::mem::size_of::<sockaddr_ll>() as u32,
+            )
+        };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!("[DEBUG create_icmp_socket] Warning: Failed to bind to eth0: {}", e);
+        } else {
+            eprintln!("[DEBUG create_icmp_socket] Bound to eth0 (ifindex={})", ifindex);
+        }
+    }
     
     // Set receive buffer size to ensure we don't miss packets
     let rcvbuf_size: c_int = 256 * 1024; // 256KB
