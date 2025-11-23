@@ -8,11 +8,15 @@ use libc::{
 };
 
 // ICMP constants
+#[allow(dead_code)]
 const ICMP_TIME_EXCEEDED: u8 = 11;
+#[allow(dead_code)]
 const ICMP_EXC_TTL: u8 = 0;
+#[allow(dead_code)]
 const SO_EE_ORIGIN_ICMP: u8 = 2;
 
 /// Create a raw IP socket for sending custom TCP packets
+#[allow(dead_code)]
 pub fn create_raw_socket() -> Result<RawFd> {
     let fd = unsafe { socket(AF_INET, SOCK_RAW, IPPROTO_RAW) };
     if fd < 0 {
@@ -41,6 +45,7 @@ pub fn create_raw_socket() -> Result<RawFd> {
 
 /// Send a TCP packet with custom TTL using raw socket
 /// This crafts a minimal TCP packet to trigger ICMP Time Exceeded responses
+#[allow(dead_code)]
 pub fn send_tcp_probe(
     fd: RawFd,
     src_ip: Ipv4Addr,
@@ -54,7 +59,7 @@ pub fn send_tcp_probe(
         src_ip, src_port, dst_ip, dst_port, ttl);
     
     // Build IP header (20 bytes) + TCP header (20 bytes)
-    let mut packet = vec![0u8; 40];
+    let mut packet = [0u8; 40];
     
     // IP Header
     packet[0] = 0x45; // Version (4) + IHL (5)
@@ -149,6 +154,7 @@ pub fn send_tcp_probe(
 }
 
 /// Enable IP_RECVERR on a socket to receive ICMP errors via MSG_ERRQUEUE
+#[allow(dead_code)]
 pub fn enable_ip_recverr(fd: RawFd) -> Result<()> {
     eprintln!("[DEBUG enable_ip_recverr] Enabling IP_RECVERR on fd={}", fd);
     let one: c_int = 1;
@@ -190,6 +196,7 @@ pub fn enable_ip_recverr(fd: RawFd) -> Result<()> {
 }
 
 /// Set IP TTL (Time-To-Live) on a socket
+#[allow(dead_code)]
 pub fn set_ip_ttl(fd: RawFd, ttl: i32) -> Result<()> {
     eprintln!("[DEBUG set_ip_ttl] Setting TTL={} on fd={}", ttl, fd);
     let rc = unsafe {
@@ -229,6 +236,7 @@ pub fn set_ip_ttl(fd: RawFd, ttl: i32) -> Result<()> {
 
 /// Non-blocking poll of the kernel error queue for ICMP Time Exceeded router address.
 /// We use a small blocking recvmsg via a short-lived async block, but guarded by an outer timeout.
+#[allow(dead_code)]
 pub async fn poll_errqueue(fd: RawFd) -> Result<Option<String>> {
     // Do a single recvmsg(MSG_ERRQUEUE). This is a blocking syscall;
     // call it inside spawn_blocking so we don't block the Tokio reactor.

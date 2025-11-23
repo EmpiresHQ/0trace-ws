@@ -1,5 +1,5 @@
 use crate::events::event_bus;
-use crate::socket::{create_raw_socket, enable_ip_recverr, poll_errqueue, send_tcp_probe};
+use crate::socket2::{create_raw_socket, create_icmp_socket, poll_icmp_socket, send_tcp_probe};
 use crate::types::Hop;
 use futures::{SinkExt, StreamExt};
 use std::net::{SocketAddr, Ipv4Addr};
@@ -14,6 +14,19 @@ use tokio_tungstenite::{
 };
 
 /// Handle a single WebSocket client connection and perform traceroute
+/// 
+/// This implements the 0trace technique: sending crafted TCP packets with
+/// incrementing TTL values to discover network hops. When a packet's TTL
+/// expires at a router, that router sends back an ICMP Time Exceeded message
+/// which we capture to identify the hop.
+/// 
+/// The process:
+/// 1. Accept WebSocket connection from client
+/// 2. Create a raw IP socket for sending custom TCP packets
+/// 3. For each TTL (1..max_hops):
+///    - Send a crafted TCP packet mimicking the real connection
+///    - Wait for ICMP Time Exceeded response from intermediate router
+///    - Report the router's IP and RTT to client via WebSocket
 pub async fn handle_client(
     stream: TcpStream,
     peer: SocketAddr,
@@ -47,11 +60,14 @@ pub async fn handle_client(
         &serde_json::json!({ "clientId": peer_id }),
     );
 
-    // Get TCP connection details
+    // Extract connection details from the established TCP socket
+    // We need: local IP:port and remote IP:port to craft realistic TCP packets
     let tcp = ws.get_ref();
     let tcp_fd = tcp.as_raw_fd();
     
-    // Get local and remote addresses
+    // Get local and remote addresses for the TCP connection
+    // These will be used to craft probe packets that look like they're part
+    // of the real connection (same src/dst IP:port)
     let (local_addr, remote_addr) = unsafe {
         let mut local: libc::sockaddr_storage = std::mem::zeroed();
         let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
@@ -75,7 +91,9 @@ pub async fn handle_client(
     eprintln!("[DEBUG handler] Connection: {}:{} -> {}:{}", 
         local_addr.0, local_addr.1, remote_addr.0, remote_addr.1);
 
-    // Create raw socket for sending TCP probes
+    // Create a raw IP socket for sending custom TCP packets with specific TTL
+    // This is the key to 0trace: we send packets that mimic the real connection
+    // but with low TTL values to trigger ICMP responses from routers
     let raw_fd = match create_raw_socket() {
         Ok(fd) => fd,
         Err(e) => {
@@ -87,15 +105,21 @@ pub async fn handle_client(
         }
     };
 
-    // Enable IP_RECVERR on raw socket to receive ICMP errors
-    if let Err(e) = enable_ip_recverr(raw_fd) {
-        event_bus().emit(
-            "error",
-            &serde_json::json!({"clientId": peer_id, "message": format!("IP_RECVERR enable failed: {}", e)}),
-        );
-        unsafe { libc::close(raw_fd) };
-        return;
-    }
+    // Create a raw ICMP socket for receiving ICMP Time Exceeded messages
+    // Unlike MSG_ERRQUEUE approach, we create a separate socket that receives
+    // ALL ICMP packets, then filter for Time Exceeded messages matching our IP IDs
+    // This is similar to how the Go implementation uses pcap to capture ICMP
+    let icmp_fd = match create_icmp_socket() {
+        Ok(fd) => fd,
+        Err(e) => {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": peer_id, "message": format!("create ICMP socket failed: {}", e)}),
+            );
+            unsafe { libc::close(raw_fd) };
+            return;
+        }
+    };
 
     // Split WebSocket so we can send/receive
     let (mut ws_writer, mut ws_reader) = ws.split();
@@ -103,6 +127,9 @@ pub async fn handle_client(
     // Tracing task
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let peer_id_clone = peer_id.clone();
+    
+    // Generate a base TCP sequence number for our probe packets
+    // Each TTL will use seq_base + ttl to make packets unique
     let seq_base = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -114,15 +141,23 @@ pub async fn handle_client(
             .send(Message::Text(r#"{"type":"connected","message":"zerotrace connected"}"#.into()))
             .await;
 
-        // Walk TTL from 1..=max_hops
+        // Traceroute: increment TTL from 1 to max_hops
+        // Each iteration sends a probe packet and waits for ICMP response
         for ttl in 1..=max_hops {
             eprintln!("[DEBUG handler] === Starting hop TTL={} ===", ttl);
             
-            // Send TCP probe packets with current TTL using raw socket
+            // Send a crafted TCP packet with the current TTL
+            // The packet mimics the real connection (same src/dst IP:port)
+            // but has a low TTL that will expire at the target hop
             let send_at = tokio::time::Instant::now();
             let seq = seq_base.wrapping_add(ttl as u32);
             
             eprintln!("[DEBUG handler] Sending raw TCP probe for TTL={}", ttl);
+            
+            // send_tcp_probe crafts a complete IP + TCP packet with:
+            // - Custom TTL (will expire at router #ttl)
+            // - Source/dest matching the real WebSocket connection
+            // - Unique IP ID for packet identification
             let ip_id = match send_tcp_probe(
                 raw_fd,
                 local_addr.0,
@@ -145,8 +180,10 @@ pub async fn handle_client(
             
             eprintln!("[DEBUG handler] Probe sent (IP ID={}), waiting for ICMP response...", ip_id);
 
-            // Poll kernel errqueue for Time Exceeded from the router for up to ttl_timeout
-            match timeout(ttl_timeout, async move { poll_errqueue(raw_fd).await }).await {
+            // Poll the ICMP socket for Time Exceeded messages
+            // The ICMP socket receives all ICMP packets; we filter by IP ID
+            // to match responses to our specific probe packet
+            match timeout(ttl_timeout, async move { poll_icmp_socket(icmp_fd, ip_id).await }).await {
                 Ok(Ok(Some(router))) => {
                     let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[DEBUG handler] Got router IP: {}, RTT: {:.2}ms", router, rtt_ms);
@@ -172,8 +209,11 @@ pub async fn handle_client(
                         .await;
                 }
                 Ok(Ok(None)) => {
-                    eprintln!("[DEBUG handler] No ICMP response (poll_errqueue returned None)");
-                    // No ICMP; maybe reached destination (no Time Exceeded), or filtered.
+                    eprintln!("[DEBUG handler] No ICMP response (poll_icmp_socket returned None)");
+                    // No ICMP response - could mean:
+                    // - Router doesn't send ICMP (filtered/configured not to)
+                    // - We reached the destination (no TTL expiry)
+                    // - Packet was lost
                     let _ = ws_writer
                         .send(Message::Text(format!(
                             r#"{{"type":"hop","ttl":{},"note":"no-icmp"}}"#,
@@ -191,7 +231,7 @@ pub async fn handle_client(
                 }
                 Err(_) => {
                     eprintln!("[DEBUG handler] Timeout waiting for ICMP");
-                    // timeout
+                    // Timeout - router didn't respond in time
                     let _ = ws_writer
                         .send(Message::Text(format!(
                             r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
@@ -206,9 +246,12 @@ pub async fn handle_client(
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
             .await;
         
-        // Clean up raw socket
-        unsafe { libc::close(raw_fd) };
-        eprintln!("[DEBUG handler] Closed raw socket");
+        // Clean up sockets
+        unsafe { 
+            libc::close(raw_fd);
+            libc::close(icmp_fd);
+        };
+        eprintln!("[DEBUG handler] Closed raw and ICMP sockets");
         
         let _ = done_tx.send(());
     });
