@@ -10,8 +10,15 @@ export interface ServerOptions {
   perTtlTimeoutMs?: number
   ifaceHint?: string
 }
-export declare function startServer(opts: ServerOptions): ServerHandle
-export declare class ServerHandle {
+export declare function startServer(opts: ServerOptions): Server
+export declare class Server {
+  /**
+   * Start the server and block until it's stopped
+   * This method never returns unless the server is stopped via stop()
+   */
+  start(): void
+  /** Stop the server */
   stop(): void
+  /** Register event listener */
   on(event: string, cb: (...args: any[]) => any): void
 }

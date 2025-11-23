@@ -34,6 +34,7 @@ export interface ZeroTraceServer {
   on(event: 'clientConnected', listener: (client: ClientConnectedEvent) => void): void;
   on(event: 'clientDone', listener: (done: ClientDoneEvent) => void): void;
   on(event: 'error', listener: (error: ErrorEvent) => void): void;
+  start(): void;
   stop(): void;
 }
 

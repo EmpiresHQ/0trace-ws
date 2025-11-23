@@ -47,7 +47,7 @@ wsServer.on('error', (e: ErrorEvent) => {
 
 console.log(`WebSocket server running on ws://0.0.0.0:${WS_PORT}`);
 
-// Graceful shutdown
+// Graceful shutdown handlers
 process.on('SIGINT', () => {
   console.log('\nShutting down WebSocket server...');
   wsServer.stop();
@@ -59,3 +59,6 @@ process.on('SIGTERM', () => {
   wsServer.stop();
   process.exit(0);
 });
+
+// Start the server - this blocks forever until stopped
+wsServer.start();

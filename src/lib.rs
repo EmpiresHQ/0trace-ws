@@ -17,80 +17,87 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 // Re-export public types
-pub use types::{ServerHandle, ServerOptions};
+pub use types::{Server, ServerOptions};
 
 // ------------- N-API entry: start_server ---------------------
 
 
 #[napi]
-pub fn start_server(opts: ServerOptions) -> napi::Result<ServerHandle> {
+pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
     let host = opts.host.unwrap_or_else(|| "0.0.0.0".into());
     let port = opts.port;
     let max_hops = opts.max_hops.unwrap_or(30);
     let per_ttl = opts.per_ttl_timeout_ms.unwrap_or(1200);
 
-    // Dedicated Tokio runtime for the server
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| napi::Error::from_reason(format!("tokio runtime: {}", e)))?;
-
     let (shutdown_tx, _) = broadcast::channel::<()>(8);
-    let ctl = types::ServerCtl {
+    let server_task = types::ServerTask {
+        host,
+        port,
+        max_hops,
+        per_ttl,
         shutdown_tx: shutdown_tx.clone(),
     };
 
-    rt.spawn(async move {
-        let addr = format!("{}:{}", host, port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
+    Ok(Server { 
+        task: std::sync::Arc::new(std::sync::Mutex::new(Some(server_task))),
+        shutdown_tx,
+    })
+}
+
+pub(crate) async fn run_server_loop(
+    host: String,
+    port: u16,
+    max_hops: u32,
+    per_ttl: u32,
+    shutdown_tx: broadcast::Sender<()>,
+) {
+    let addr = format!("{}:{}", host, port);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            events::event_bus().emit(
+                "error",
+                &serde_json::json!({"message": format!("bind failed: {}", e)}),
+            );
+            return;
+        }
+    };
+
+    events::event_bus().emit(
+        "clientConnected",
+        &serde_json::json!({"message": format!("listening on {}", addr)}),
+    );
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
                 events::event_bus().emit(
-                    "error",
-                    &serde_json::json!({"message": format!("bind failed: {}", e)}),
+                    "clientDone",
+                    &serde_json::json!({"message": "server stopping"}),
                 );
-                return;
+                break;
             }
-        };
-
-        events::event_bus().emit(
-            "clientConnected",
-            &serde_json::json!({"message": format!("listening on {}", addr)}),
-        );
-
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    events::event_bus().emit(
-                        "clientDone",
-                        &serde_json::json!({"message": "server stopping"}),
-                    );
-                    break;
-                }
-                accept_res = listener.accept() => {
-                    match accept_res {
-                        Ok((stream, peer)) => {
-                            tokio::spawn(handler::handle_client(
-                                stream,
-                                peer,
-                                max_hops as u8,
-                                Duration::from_millis(per_ttl as u64),
-                            ));
-                        }
-                        Err(e) => {
-                            events::event_bus().emit(
-                                "error",
-                                &serde_json::json!({"message": format!("accept failed: {}", e)}),
-                            );
-                        }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, peer)) => {
+                        tokio::spawn(handler::handle_client(
+                            stream,
+                            peer,
+                            max_hops as u8,
+                            Duration::from_millis(per_ttl as u64),
+                        ));
+                    }
+                    Err(e) => {
+                        events::event_bus().emit(
+                            "error",
+                            &serde_json::json!({"message": format!("accept failed: {}", e)}),
+                        );
                     }
                 }
             }
         }
-    });
-
-    Ok(ServerHandle { rt, ctl })
+    }
 }
 
 // ------------- Unit Tests --------------------------
