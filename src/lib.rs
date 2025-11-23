@@ -107,6 +107,7 @@ mod tests {
             ttl: 5,
             router: "192.168.1.1".to_string(),
             rtt_ms: 12.34,
+            modifications: None,
         };
 
         let json = serde_json::to_string(&hop).unwrap();
@@ -142,6 +143,7 @@ mod tests {
                 ttl,
                 router: "10.0.0.1".to_string(),
                 rtt_ms: 1.0,
+                modifications: None,
             };
             assert!(hop.ttl > 0);
         }

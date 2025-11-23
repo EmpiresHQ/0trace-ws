@@ -5,6 +5,7 @@ services:
     image: ${DOCKER_REGISTRY}/zerotrace-ws:latest
     container_name: zerotrace
     restart: unless-stopped
+    command: ["npm", "run", "start:http"]
     logging:
       driver: "json-file"
       options:
@@ -20,6 +21,7 @@ services:
       - "traefik.docker.network=web"
     environment:
       - NODE_ENV=production
+      - HTTP_PORT=3000
 
   zerotrace-ws:
     env_file:
@@ -27,6 +29,7 @@ services:
     image: ${DOCKER_REGISTRY}/zerotrace-ws:latest
     container_name: zerotrace-ws
     restart: unless-stopped
+    command: ["npm", "run", "start:ws"]
     privileged: true
     # Required for ICMP packet capture
     cap_add:
@@ -51,6 +54,9 @@ services:
       - "traefik.docker.network=web"
     environment:
       - NODE_ENV=production
+      - WS_PORT=8080
+      - MAX_HOPS=30
+      - PER_TTL_TIMEOUT_MS=1200
 
 networks:
   web:
