@@ -21,6 +21,61 @@ pub use types::{Server, ServerOptions};
 
 // ------------- N-API entry: start_server ---------------------
 
+/// Handle middleware request in JS thread
+/// Calls the middleware function, awaits the Promise, and sends result back
+fn handle_middleware_request(
+    ctx: napi::threadsafe_function::ThreadSafeCallContext<types::MiddlewareRequest>,
+) -> napi::Result<Vec<napi::JsUnknown>> {
+    eprintln!("[DEBUG lib] Middleware TSFN called");
+    let req = ctx.value;
+    let hop_json = req.hop_json.clone();
+    let response_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(req.response_tx)));
+    
+    // Parse JSON to object
+    let global = ctx.env.get_global()?;
+    let json_obj: napi::JsObject = global.get_named_property("JSON")?;
+    let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
+    let json_str = ctx.env.create_string(&hop_json)?;
+    let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
+    
+    // Get middleware from global scope
+    let middleware_fn: napi::JsFunction = global.get_named_property("__zerotrace_middleware")?;
+    
+    // Call middleware with hop object - it returns Promise<String>
+    eprintln!("[DEBUG lib] Calling middleware function...");
+    let promise_result = middleware_fn.call(None, &[hop_obj])?;
+    
+    // Convert to Promise<String>
+    use napi::bindgen_prelude::*;
+    use napi::NapiRaw;
+    let promise = unsafe {
+        Promise::<String>::from_napi_value(ctx.env.raw(), NapiRaw::raw(&promise_result))?
+    };
+    
+    eprintln!("[DEBUG lib] Got Promise<String>, spawning tokio task to await");
+    
+    // Spawn tokio task to await the Promise
+    tokio::spawn(async move {
+        eprintln!("[DEBUG lib] Awaiting Promise...");
+        
+        match promise.await {
+            Ok(enriched_json) => {
+                eprintln!("[DEBUG lib] Promise resolved! Got JSON string");
+                if let Some(tx) = response_tx.lock().unwrap().take() {
+                    let _ = tx.send(enriched_json);
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG lib] Promise rejected: {:?}", e);
+                if let Some(tx) = response_tx.lock().unwrap().take() {
+                    let _ = tx.send(hop_json);
+                }
+            }
+        }
+    });
+    
+    Ok(vec![ctx.env.get_undefined()?.into_unknown()])
+}
 
 #[napi]
 pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
@@ -29,50 +84,33 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
     let max_hops = opts.max_hops.unwrap_or(30);
     let per_ttl = opts.per_ttl_timeout_ms.unwrap_or(1200);
 
-    // Create threadsafe middleware function if provided
-    let middleware = if let Some(js_fn) = opts.middleware {
-        eprintln!("[DEBUG lib] Creating middleware ThreadsafeFunction");
-        let tsfn = js_fn.create_threadsafe_function(
-            0,
-            |ctx: napi::threadsafe_function::ThreadSafeCallContext<types::MiddlewareContext>| {
-                eprintln!("[DEBUG lib] Middleware ThreadsafeFunction called!");
-                let json_data = ctx.value.json_data;
-                let sender = ctx.value.sender;
-                
-                // Parse JSON to object for JS using JSON.parse
-                let global = ctx.env.get_global()?;
-                let json_obj: napi::JsObject = global.get_named_property("JSON")?;
-                let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
-                let json_str = ctx.env.create_string(&json_data)?;
-                let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
-                
-                // Create next() callback function that receives object and converts back to JSON
-                let next_fn = ctx.env.create_function_from_closure("next", move |ctx| {
-                    eprintln!("[DEBUG lib] next() callback called from JS!");
-                    let enriched_obj: napi::JsUnknown = ctx.get(0)?;
-                    // Use JSON.stringify to convert object back to string
-                    let global = ctx.env.get_global()?;
-                    let json_obj: napi::JsObject = global.get_named_property("JSON")?;
-                    let json_stringify: napi::JsFunction = json_obj.get_named_property("stringify")?;
-                    let json_result_unknown: napi::JsUnknown = json_stringify.call(None, &[enriched_obj])?;
-                    let json_result: napi::JsString = json_result_unknown.coerce_to_string()?;
-                    let enriched_json = json_result.into_utf8()?.as_str()?.to_string();
-                    eprintln!("[DEBUG lib] next() sending enriched JSON: {}", enriched_json);
-                    if let Some(tx) = sender.lock().unwrap().take() {
-                        let _ = tx.send(enriched_json);
-                        eprintln!("[DEBUG lib] next() sent through channel");
-                    } else {
-                        eprintln!("[DEBUG lib] next() ERROR: channel already used!");
+    // Create channel for middleware requests if middleware provided
+    let middleware_tx = if let Some(js_fn) = opts.middleware {
+        eprintln!("[DEBUG lib] Setting up middleware channel");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<types::MiddlewareRequest>();
+        
+        // Create threadsafe function to call middleware
+        let tsfn = js_fn.create_threadsafe_function(0, handle_middleware_request)?;
+        
+        // Spawn task to forward requests from channel to TSFN
+        std::thread::spawn(move || {
+            eprintln!("[DEBUG lib] Middleware forwarder thread started");
+            loop {
+                match rx.blocking_recv() {
+                    Some(req) => {
+                        eprintln!("[DEBUG lib] Forwarding middleware request");
+                        use napi::threadsafe_function::{ThreadsafeFunction as TSF, ThreadsafeFunctionCallMode, ErrorStrategy};
+                        TSF::<_, ErrorStrategy::Fatal>::call(&tsfn, req, ThreadsafeFunctionCallMode::NonBlocking);
                     }
-                    ctx.env.get_undefined()
-                })?;
-                
-                // Pass [hop_object, next_callback] to middleware
-                Ok(vec![hop_obj, next_fn.into_unknown()])
-            },
-        )?;
-        eprintln!("[DEBUG lib] Middleware ThreadsafeFunction created successfully");
-        Some(tsfn)
+                    None => {
+                        eprintln!("[DEBUG lib] Middleware channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Some(tx)
     } else {
         eprintln!("[DEBUG lib] No middleware provided");
         None
@@ -85,7 +123,7 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
         max_hops,
         per_ttl,
         shutdown_tx: shutdown_tx.clone(),
-        middleware,
+        middleware_tx,
     };
 
     Ok(Server { 
@@ -100,7 +138,7 @@ pub(crate) async fn run_server_loop(
     max_hops: u32,
     per_ttl: u32,
     shutdown_tx: broadcast::Sender<()>,
-    middleware: Option<types::MiddlewareFunction>,
+    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<types::MiddlewareRequest>>,
 ) {
     let addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -132,13 +170,13 @@ pub(crate) async fn run_server_loop(
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((stream, peer)) => {
-                        let middleware_clone = middleware.clone();
+                        let middleware_tx_clone = middleware_tx.clone();
                         tokio::spawn(handler::handle_client(
                             stream,
                             peer,
                             max_hops as u8,
                             Duration::from_millis(per_ttl as u64),
-                            middleware_clone,
+                            middleware_tx_clone,
                         ));
                     }
                     Err(e) => {

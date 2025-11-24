@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # N-API
-napi = { version = "2", features = ["napi5"] }
+napi = { version = "2", features = ["napi5", "napi4", "tokio_rt"] }
 napi-derive = "2"
 
 # Async stack

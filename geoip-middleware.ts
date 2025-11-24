@@ -13,63 +13,31 @@ export interface EnrichedHopEvent extends HopEvent {
  * GeoIP enrichment middleware
  * 
  * @param hopData - Hop data object from traceroute
- * @param next - Callback to send enriched data back: next(enrichedHopObject)
+ * @returns Promise with enriched hop data as JSON string
  */
-export async function geoipMiddleware(hopData: HopEvent, next: (enrichedData: EnrichedHopEvent) => void): Promise<void> {
-  try {
-    console.log(`[GeoIP Middleware] START - Processing hop data:`, JSON.stringify(hopData));
-    
-    const ip = hopData.router || hopData.ip;
-    
-    if (!ip) {
-      console.log('[GeoIP Middleware] No IP found, sending original');
-      // No IP to enrich, send original data back
-      next(hopData);
-      return;
-    }
-
-    console.log(`[GeoIP Middleware] Enriching IP: ${ip}`);
-    
-    // TODO: Use actual MaxMind GeoIP2 database
-    // import { Reader } from '@maxmind/geoip2-node';
-    // const reader = await Reader.open('/path/to/GeoLite2-City.mmdb');
-    // const response = reader.city(ip);
-    
-    // Mock enrichment for now
-    const enriched: EnrichedHopEvent = {
-      ...hopData,
-      geo: {
-        city: 'Mock City',
-        country: 'Mock Country',
-        latitude: 0,
-        longitude: 0,
-      }
-    };
-
-    // Example with real GeoIP (commented out):
-    /*
-    try {
-      const response = reader.city(ip);
-      enriched.geo = {
-        city: response.city?.names?.en,
-        country: response.country?.names?.en,
-        latitude: response.location?.latitude,
-        longitude: response.location?.longitude,
-      };
-      console.log(`[GeoIP Middleware] Found: ${enriched.geo.city}, ${enriched.geo.country}`);
-    } catch (error) {
-      console.error(`[GeoIP Middleware] Lookup failed for ${ip}:`, error);
-    }
-    */
-
-    // Send enriched data back via next() callback
-    console.log(`[GeoIP Middleware] Calling next() with enriched data`);
-    next(enriched);
-    console.log(`[GeoIP Middleware] END - next() called successfully`);
-    
-  } catch (error) {
-    console.error('[GeoIP Middleware] ERROR:', error);
-    // On error, send original data back
-    next(hopData);
+export async function geoipMiddleware(hopData: HopEvent): Promise<string> {
+  console.log(`[GeoIP Middleware] START - Processing hop data:`, JSON.stringify(hopData));
+  
+  const ip = hopData.router || hopData.ip;
+  
+  if (!ip) {
+    console.log('[GeoIP Middleware] No IP found, returning original');
+    return JSON.stringify(hopData);
   }
+
+  console.log(`[GeoIP Middleware] Enriching IP: ${ip}`);
+  
+  // Mock enrichment
+  const enriched: EnrichedHopEvent = {
+    ...hopData,
+    geo: {
+      city: 'Mock City',
+      country: 'Mock Country',
+      latitude: 0,
+      longitude: 0,
+    }
+  };
+
+  console.log(`[GeoIP Middleware] Returning enriched data as JSON string`);
+  return JSON.stringify(enriched);
 }
