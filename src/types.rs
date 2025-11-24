@@ -111,4 +111,11 @@ impl Server {
         crate::events::event_bus().register(event, cb)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
+
+    /// Remove all event listeners for a specific event
+    #[napi]
+    pub fn off(&self, event: String) -> napi::Result<()> {
+        crate::events::event_bus().off(&event);
+        Ok(())
+    }
 }

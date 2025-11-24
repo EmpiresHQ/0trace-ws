@@ -1,15 +1,30 @@
-use napi::JsFunction;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::broadcast;
+use napi::threadsafe_function::{ThreadsafeFunction, ErrorStrategy};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+
+type EventCallback = ThreadsafeFunction<String, ErrorStrategy::Fatal>;
 
 pub struct EventBusInner {
-    tx: broadcast::Sender<String>,
+    listeners: Mutex<HashMap<String, Vec<EventCallback>>>,
 }
 
 impl Default for EventBusInner {
     fn default() -> Self {
-        let (tx, _rx) = broadcast::channel(1024);
-        Self { tx }
+        Self {
+            listeners: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Drop for EventBusInner {
+    fn drop(&mut self) {
+        // Release all threadsafe functions when event bus is dropped
+        let mut listeners = self.listeners.lock().unwrap();
+        for (_, callbacks) in listeners.drain() {
+            for cb in callbacks {
+                cb.abort().ok();
+            }
+        }
     }
 }
 
@@ -20,20 +35,52 @@ impl EventBus {
         Self(Arc::new(Default::default()))
     }
 
-    pub fn register(&self, event: String, cb: JsFunction) -> anyhow::Result<()> {
-        // TODO: Implement proper event callback registration
-        // For now, just subscribe to prevent compilation errors
-        // In a proper implementation, we'd need to use napi::threadsafe_function
-        let _rx = self.0.tx.subscribe();
-        let _ = (event, cb); // Suppress unused warnings
+    pub fn register(&self, event: String, cb: napi::JsFunction) -> anyhow::Result<()> {
+        // Convert JS function to ThreadsafeFunction
+        let tsfn = cb.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<String>| {
+                // Parse JSON string to object and pass to callback
+                let global = ctx.env.get_global()?;
+                let json_obj: napi::JsObject = global.get_named_property("JSON")?;
+                let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
+                let json_str = ctx.env.create_string(&ctx.value)?;
+                let event_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
+                
+                Ok(vec![event_obj])
+            },
+        )?;
+        
+        // Store the callback
+        let mut listeners = self.0.listeners.lock().unwrap();
+        listeners.entry(event).or_default().push(tsfn);
+        
         Ok(())
     }
 
+    pub fn off(&self, event: &str) {
+        // Remove all listeners for this event
+        let mut listeners = self.0.listeners.lock().unwrap();
+        if let Some(callbacks) = listeners.remove(event) {
+            // Abort all threadsafe functions for this event
+            for cb in callbacks {
+                cb.abort().ok();
+            }
+        }
+    }
+
     pub fn emit(&self, typ: &str, payload: &serde_json::Value) {
-        let _ = self
-            .0
-            .tx
-            .send(serde_json::json!({"type": typ, "payload": payload}).to_string());
+        let event_data = serde_json::json!({"type": typ, "payload": payload}).to_string();
+        
+        let listeners = self.0.listeners.lock().unwrap();
+        if let Some(callbacks) = listeners.get(typ) {
+            for cb in callbacks {
+                cb.call(
+                    event_data.clone(),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        }
     }
 }
 

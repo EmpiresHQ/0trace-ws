@@ -22,4 +22,6 @@ export declare class Server {
   stop(): void
   /** Register event listener */
   on(event: string, cb: (...args: any[]) => any): void
+  /** Remove all event listeners for a specific event */
+  off(event: string): void
 }
