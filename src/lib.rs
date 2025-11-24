@@ -6,10 +6,14 @@
 //! Uses Linux-specific features to capture ICMP Time Exceeded messages
 //! and trace the network path to each connected client.
 
+mod constants;
 mod events;
 mod handler;
-mod socket;
 mod types;
+mod packet;
+mod icmp;
+mod network;
+mod connection;
 
 use napi_derive::napi;
 use tokio::net::TcpListener;
@@ -21,102 +25,15 @@ pub use types::{Server, ServerOptions};
 
 // ------------- N-API entry: start_server ---------------------
 
-/// Handle middleware request in JS thread
-/// Calls middleware function and returns Promise through channel
-fn handle_middleware_request(
-    ctx: napi::threadsafe_function::ThreadSafeCallContext<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>,
-) -> napi::Result<Vec<napi::JsUnknown>> {
-    eprintln!("[DEBUG lib] Middleware TSFN called");
-    let (hop_json, promise_tx) = ctx.value;
-    
-    // Parse JSON to object
-    let global = ctx.env.get_global()?;
-    let json_obj: napi::JsObject = global.get_named_property("JSON")?;
-    let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
-    let json_str = ctx.env.create_string(&hop_json)?;
-    let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
-    
-    // Get middleware from global scope
-    let middleware_fn: napi::JsFunction = match global.get_named_property("__zerotrace_middleware") {
-        Ok(f) => {
-            eprintln!("[DEBUG lib] Found __zerotrace_middleware in global");
-            f
-        }
-        Err(e) => {
-            eprintln!("[DEBUG lib] ERROR: Failed to get __zerotrace_middleware: {:?}", e);
-            return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
-        }
-    };
-    
-    // Call middleware with hop object - it returns Promise<String>
-    eprintln!("[DEBUG lib] Calling middleware function...");
-    let promise_result = match middleware_fn.call(None, &[hop_obj]) {
-        Ok(r) => {
-            eprintln!("[DEBUG lib] Middleware function called successfully");
-            r
-        }
-        Err(e) => {
-            eprintln!("[DEBUG lib] ERROR: Failed to call middleware: {:?}", e);
-            return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
-        }
-    };
-    
-    // Convert to Promise<String>
-    use napi::bindgen_prelude::*;
-    use napi::NapiRaw;
-    let promise = unsafe {
-        Promise::<String>::from_napi_value(ctx.env.raw(), NapiRaw::raw(&promise_result))?
-    };
-    
-    eprintln!("[DEBUG lib] Got Promise<String>, sending through channel");
-    
-    // Send Promise through channel (Promise is Send!)
-    let _ = promise_tx.send(promise);
-    
-    Ok(vec![ctx.env.get_undefined()?.into_unknown()])
-}
-
 #[napi]
 pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
-    let host = opts.host.unwrap_or_else(|| "0.0.0.0".into());
+    let host = opts.host.unwrap_or_else(|| constants::DEFAULT_BIND_HOST.into());
     let port = opts.port;
-    let max_hops = opts.max_hops.unwrap_or(30);
-    let per_ttl = opts.per_ttl_timeout_ms.unwrap_or(1200);
+    let max_hops = opts.max_hops.unwrap_or(constants::DEFAULT_MAX_HOPS);
+    let per_ttl = opts.per_ttl_timeout_ms.unwrap_or(constants::DEFAULT_PER_TTL_TIMEOUT_MS);
 
-    // Create channel for middleware requests if middleware provided
-    let middleware_tx = if let Some(js_fn) = opts.middleware {
-        eprintln!("[DEBUG lib] Setting up middleware channel");
-        
-        // Channel to send hop_json, receive Promise back
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>();
-        
-        // Create threadsafe function to call middleware
-        let tsfn = js_fn.create_threadsafe_function(0, handle_middleware_request)?;
-        
-        // Spawn thread to forward requests to TSFN
-        std::thread::spawn(move || {
-            eprintln!("[DEBUG lib] Middleware forwarder thread started");
-            
-            loop {
-                match rx.blocking_recv() {
-                    Some((hop_json, promise_tx)) => {
-                        eprintln!("[DEBUG lib] Forwarding middleware request");
-                        use napi::threadsafe_function::{ThreadsafeFunction as TSF, ThreadsafeFunctionCallMode, ErrorStrategy};
-                        TSF::<_, ErrorStrategy::Fatal>::call(&tsfn, (hop_json, promise_tx), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                    None => {
-                        eprintln!("[DEBUG lib] Middleware channel closed");
-                        break;
-                    }
-                }
-            }
-        });
-        
-        Some(tx)
-    } else {
-        eprintln!("[DEBUG lib] No middleware provided");
-        None
-    };
+    // No middleware handling needed here - it's called directly on JS side
+    // and returns Promise<String> which is Send and can be awaited in Rust
 
     let (shutdown_tx, _) = broadcast::channel::<()>(8);
     let server_task = types::ServerTask {
@@ -125,7 +42,6 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
         max_hops,
         per_ttl,
         shutdown_tx: shutdown_tx.clone(),
-        middleware_tx,
     };
 
     Ok(Server { 
@@ -140,7 +56,6 @@ pub(crate) async fn run_server_loop(
     max_hops: u32,
     per_ttl: u32,
     shutdown_tx: broadcast::Sender<()>,
-    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
 ) {
     let addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -172,13 +87,12 @@ pub(crate) async fn run_server_loop(
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((stream, peer)) => {
-                        let middleware_tx_clone = middleware_tx.clone();
                         tokio::spawn(handler::handle_client(
                             stream,
                             peer,
                             max_hops as u8,
                             Duration::from_millis(per_ttl as u64),
-                            middleware_tx_clone,
+                            None, // No middleware channel needed
                         ));
                     }
                     Err(e) => {
@@ -224,7 +138,6 @@ mod tests {
             max_hops: None,
             per_ttl_timeout_ms: None,
             iface_hint: None,
-            middleware: None,
         };
 
         let host = opts.host.unwrap_or_else(|| "0.0.0.0".into());

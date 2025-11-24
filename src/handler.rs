@@ -1,532 +1,499 @@
+/// WebSocket client handler for 0trace traceroute
+
+use crate::connection::{extract_connection_params, extract_real_client_ip};
+use crate::constants::*;
 use crate::events::event_bus;
-use crate::socket::{create_raw_socket, create_icmp_socket, poll_icmp_any, send_tcp_probe};
+use crate::network::{create_icmp_socket, create_raw_socket, poll_icmp_responses, send_tcp_probe};
 use crate::types::Hop;
 use futures::{SinkExt, StreamExt};
-use std::net::{SocketAddr, Ipv4Addr};
-use std::os::fd::AsRawFd;
+use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{
     accept_hdr_async,
-    tungstenite::handshake::server::{Request, Response, ErrorResponse},
+    tungstenite::handshake::server::{ErrorResponse, Request, Response},
     tungstenite::Message,
 };
 
-/// Handle a single WebSocket client connection and perform traceroute
-/// 
-/// This implements the 0trace technique: sending crafted TCP packets with
-/// incrementing TTL values to discover network hops. When a packet's TTL
-/// expires at a router, that router sends back an ICMP Time Exceeded message
-/// which we capture to identify the hop.
-/// 
-/// The process:
-/// 1. Accept WebSocket connection from client
-/// 2. Create a raw IP socket for sending custom TCP packets
-/// 3. For each TTL (1..max_hops):
-///    - Send a crafted TCP packet mimicking the real connection
-///    - Wait for ICMP Time Exceeded response from intermediate router
-///    - Report the router's IP and RTT to client via WebSocket
+type MiddlewareChannel = tokio::sync::mpsc::UnboundedSender<(
+    String,
+    tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>,
+)>;
+
+/// Handle a single WebSocket client connection and perform 0trace traceroute
 pub async fn handle_client(
-    stream: TcpStream,
-    peer: SocketAddr,
+    tcp_stream: TcpStream,
+    peer_address: SocketAddr,
     max_hops: u8,
     ttl_timeout: Duration,
-    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
+    middleware_channel: Option<MiddlewareChannel>,
 ) {
-    let peer_id = format!("{}", peer);
+    let client_id = format!("{}", peer_address);
     
-    // Will store real client IP from headers
-    let real_client_ip = std::sync::Arc::new(std::sync::Mutex::new(None::<Ipv4Addr>));
-    let real_client_ip_clone = real_client_ip.clone();
-
-    // Do WebSocket handshake
-    let cb = move |req: &Request,
-              mut resp: Response|
-     -> Result<Response, ErrorResponse> {
-        // Try to get real IP from proxy headers
-        if let Some(forwarded) = req.headers().get("X-Forwarded-For") {
-            if let Ok(forwarded_str) = forwarded.to_str() {
-                // X-Forwarded-For can be "client, proxy1, proxy2"
-                if let Some(client_ip) = forwarded_str.split(',').next() {
-                    if let Ok(ip) = client_ip.trim().parse::<Ipv4Addr>() {
-                        eprintln!("[DEBUG handler] Real client IP from X-Forwarded-For: {}", ip);
-                        *real_client_ip_clone.lock().unwrap() = Some(ip);
-                    }
-                }
-            }
-        } else if let Some(real_ip) = req.headers().get("X-Real-IP") {
-            if let Ok(ip_str) = real_ip.to_str() {
-                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                    eprintln!("[DEBUG handler] Real client IP from X-Real-IP: {}", ip);
-                    *real_client_ip_clone.lock().unwrap() = Some(ip);
-                }
-            }
-        }
-        
-        resp.headers_mut()
-            .insert("X-ZeroTrace", "ok".parse().unwrap());
-        Ok(resp)
-    };
+    // Extract real client IP and connection parameters
+    let (real_client_ip, websocket_stream, connection_params) =
+        match setup_websocket_connection(tcp_stream, peer_address, &client_id).await {
+            Ok(result) => result,
+            Err(_) => return,
+        };
     
-    let ws = match accept_hdr_async(stream, cb).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            event_bus().emit(
-                "error",
-                &serde_json::json!({"message": format!("handshake error from {}: {}", peer_id, e)}),
-            );
-            return;
-        }
-    };
-
     event_bus().emit(
         "clientConnected",
-        &serde_json::json!({ "clientId": peer_id }),
+        &serde_json::json!({ "clientId": client_id }),
     );
-
-    // Extract connection details from the established TCP socket
-    let tcp = ws.get_ref();
-    let tcp_fd = tcp.as_raw_fd();
     
-    // Get the actual WebSocket connection parameters (as seen from inside container)
-    let (ws_local_addr, ws_peer_addr) = unsafe {
-        let mut local: libc::sockaddr_storage = std::mem::zeroed();
-        let mut local_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        let ret = libc::getsockname(tcp_fd, &mut local as *mut _ as *mut libc::sockaddr, &mut local_len);
-        if ret != 0 {
-            event_bus().emit(
-                "error",
-                &serde_json::json!({"clientId": peer_id, "message": "getsockname failed"}),
-            );
-            return;
-        }
-        
-        let mut peer: libc::sockaddr_storage = std::mem::zeroed();
-        let mut peer_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        let ret = libc::getpeername(tcp_fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut peer_len);
-        if ret != 0 {
-            event_bus().emit(
-                "error",
-                &serde_json::json!({"clientId": peer_id, "message": "getpeername failed"}),
-            );
-            return;
-        }
-        
-        let local_in = &*((&local) as *const _ as *const libc::sockaddr_in);
-        let local_ip = Ipv4Addr::from(u32::from_be(local_in.sin_addr.s_addr));
-        let local_port = u16::from_be(local_in.sin_port);
-        
-        let peer_in = &*((&peer) as *const _ as *const libc::sockaddr_in);
-        let peer_ip = Ipv4Addr::from(u32::from_be(peer_in.sin_addr.s_addr));
-        let peer_port = u16::from_be(peer_in.sin_port);
-        
-        ((local_ip, local_port), (peer_ip, peer_port))
+    eprintln!(
+        "[DEBUG handler] Connection established: {}:{} <-> {}:{}",
+        connection_params.local_ip,
+        connection_params.local_port,
+        real_client_ip,
+        connection_params.peer_port
+    );
+    
+    // Create network sockets for sending probes and receiving ICMP
+    let (raw_socket_fd, icmp_socket_fd) = match setup_network_sockets(&client_id) {
+        Ok(sockets) => sockets,
+        Err(_) => return,
     };
     
-    eprintln!("[DEBUG handler] WebSocket connection: {}:{} <-> {}:{}", 
-        ws_local_addr.0, ws_local_addr.1, ws_peer_addr.0, ws_peer_addr.1);
+    // Split WebSocket for concurrent read/write
+    let (websocket_writer, websocket_reader) = websocket_stream.split();
     
-    // Get REAL client IP from headers (required behind proxy like Traefik)
-    let real_client_ip = if let Some(real_ip) = *real_client_ip.lock().unwrap() {
-        eprintln!("[DEBUG handler] Real client IP from headers: {}", real_ip);
-        real_ip
-    } else {
-        eprintln!("[DEBUG handler] No X-Forwarded-For or X-Real-IP header found!");
-        match peer.ip() {
-            std::net::IpAddr::V4(ip) => {
-                eprintln!("[DEBUG handler] WARNING: Using peer IP {} (likely proxy!)", ip);
-                ip
-            },
-            _ => {
-                eprintln!("[DEBUG handler] IPv6 not supported");
-                return;
-            }
+    // Send greeting message
+    let websocket_writer = match send_greeting(websocket_writer).await {
+        Ok(writer) => writer,
+        Err(_) => {
+            cleanup_sockets(raw_socket_fd, icmp_socket_fd);
+            return;
         }
     };
     
-    // 0trace approach: Use ACTUAL WebSocket connection parameters
-    // Send probe packets that perfectly mimic the real WebSocket connection:
-    // - Same source IP:port (container side of WebSocket)
-    // - Same dest IP:port (client side of WebSocket)
-    // This makes probes indistinguishable from the real connection, avoiding:
-    // 1. Port scanning detection (sending to 80/443 when client uses different port)
-    // 2. IDS/IPS triggers (suspicious traffic patterns)
-    // 3. Makes probes look like legitimate retransmissions/packet loss
-    let trace_params = (ws_local_addr.0, ws_local_addr.1, real_client_ip, ws_peer_addr.1);
+    // Run traceroute
+    let (completion_signal_tx, completion_signal_rx) = oneshot::channel::<()>();
     
-    eprintln!("[DEBUG handler] Trace packets: {}:{} -> {}:{}", 
-        trace_params.0, trace_params.1, trace_params.2, trace_params.3);
-    eprintln!("[DEBUG handler] (Mimicking actual WebSocket connection for stealth)");
+    let traceroute_task = tokio::spawn(run_traceroute(
+        client_id.clone(),
+        raw_socket_fd,
+        icmp_socket_fd,
+        connection_params.local_ip,
+        connection_params.local_port,
+        real_client_ip,
+        connection_params.peer_port,
+        max_hops,
+        ttl_timeout,
+        websocket_writer,
+        middleware_channel,
+        completion_signal_tx,
+    ));
+    
+    // Handle incoming WebSocket messages
+    let message_handler_task = tokio::spawn(handle_websocket_messages(websocket_reader));
+    
+    // Wait for completion
+    let _ = completion_signal_rx.await;
+    let _ = traceroute_task.await;
+    let _ = message_handler_task.await;
+    
+    cleanup_sockets(raw_socket_fd, icmp_socket_fd);
+    event_bus().emit("clientDone", &serde_json::json!({ "clientId": client_id }));
+}
 
-    // Create a raw IP socket for sending custom TCP packets with specific TTL
-    // This is the key to 0trace: we send packets that mimic the real connection
-    // but with low TTL values to trigger ICMP responses from routers
-    let raw_fd = match create_raw_socket() {
+/// Setup WebSocket connection and extract connection parameters
+async fn setup_websocket_connection(
+    tcp_stream: TcpStream,
+    peer_address: SocketAddr,
+    client_id: &str,
+) -> Result<(std::net::Ipv4Addr, tokio_tungstenite::WebSocketStream<TcpStream>, crate::connection::ConnectionParams), ()> {
+    // Extract connection parameters before WebSocket upgrade
+    let connection_params = match extract_connection_params(&tcp_stream) {
+        Ok(params) => params,
+        Err(e) => {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": client_id, "message": format!("Failed to extract connection params: {}", e)}),
+            );
+            return Err(());
+        }
+    };
+    
+    // Store real client IP from headers
+    let real_client_ip = std::sync::Arc::new(std::sync::Mutex::new(None::<std::net::Ipv4Addr>));
+    let real_client_ip_clone = real_client_ip.clone();
+    
+    // WebSocket handshake callback to extract headers
+    let handshake_callback = move |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+        let extracted_ip = extract_real_client_ip(request, peer_address);
+        *real_client_ip_clone.lock().unwrap() = Some(extracted_ip);
+        
+        response.headers_mut()
+            .insert("X-ZeroTrace", "ok".parse().unwrap());
+        Ok(response)
+    };
+    
+    // Perform WebSocket handshake
+    let websocket_stream = match accept_hdr_async(tcp_stream, handshake_callback).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            event_bus().emit(
+                "error",
+                &serde_json::json!({"clientId": client_id, "message": format!("WebSocket handshake failed: {}", e)}),
+            );
+            return Err(());
+        }
+    };
+    
+    let real_ip = real_client_ip
+        .lock()
+        .unwrap()
+        .unwrap_or_else(|| extract_real_client_ip(&Request::default(), peer_address));
+    
+    Ok((real_ip, websocket_stream, connection_params))
+}
+
+/// Create raw IP socket and ICMP capture socket
+fn setup_network_sockets(client_id: &str) -> Result<(i32, i32), ()> {
+    let raw_socket = match create_raw_socket() {
         Ok(fd) => fd,
         Err(e) => {
             event_bus().emit(
                 "error",
-                &serde_json::json!({"clientId": peer_id, "message": format!("create raw socket failed: {}", e)}),
+                &serde_json::json!({"clientId": client_id, "message": format!("Failed to create raw socket: {}", e)}),
             );
-            return;
+            return Err(());
         }
     };
-
-    // Create a raw ICMP socket for receiving ICMP Time Exceeded messages
-    // Unlike MSG_ERRQUEUE approach, we create a separate socket that receives
-    // ALL ICMP packets, then filter for Time Exceeded messages matching our IP IDs
-    // This is similar to how the Go implementation uses pcap to capture ICMP
-    let icmp_fd = match create_icmp_socket(Some(ws_local_addr.0)) {
+    
+    let icmp_socket = match create_icmp_socket() {
         Ok(fd) => fd,
         Err(e) => {
             event_bus().emit(
                 "error",
-                &serde_json::json!({"clientId": peer_id, "message": format!("create ICMP socket failed: {}", e)}),
+                &serde_json::json!({"clientId": client_id, "message": format!("Failed to create ICMP socket: {}", e)}),
             );
-            unsafe { libc::close(raw_fd) };
-            return;
+            unsafe { libc::close(raw_socket) };
+            return Err(());
         }
     };
+    
+    Ok((raw_socket, icmp_socket))
+}
 
-    // Ensure sockets are cleaned up on all exit paths
-    let raw_fd_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(raw_fd)));
-    let icmp_fd_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(icmp_fd)));
-    let raw_fd_cleanup = raw_fd_arc.clone();
-    let icmp_fd_cleanup = icmp_fd_arc.clone();
-
-    // Split WebSocket so we can send/receive
-    let (mut ws_writer, mut ws_reader) = ws.split();
-
-    // Send greeting
-    if let Err(e) = ws_writer
-        .send(Message::Text(r#"{"type":"connected","message":"Trace started automatically"}"#.into()))
-        .await {
-        eprintln!("[DEBUG handler] Failed to send greeting: {}", e);
-        // Clean up sockets before returning
-        if let Some(fd) = raw_fd_cleanup.lock().unwrap().take() {
-            unsafe { libc::close(fd); }
-        }
-        if let Some(fd) = icmp_fd_cleanup.lock().unwrap().take() {
-            unsafe { libc::close(fd); }
-        }
-        return;
+/// Send greeting message to client
+async fn send_greeting(
+    mut writer: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+) -> Result<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>, ()> {
+    if writer
+        .send(Message::Text(
+            r#"{"type":"connected","message":"Trace started automatically"}"#.into(),
+        ))
+        .await
+        .is_err()
+    {
+        eprintln!("[DEBUG handler] Failed to send greeting");
+        return Err(());
     }
+    Ok(writer)
+}
 
-    // 0trace approach: Send ALL probe packets immediately, then collect ICMP responses
-    // This is the key difference from traditional traceroute which sends one packet,
-    // waits for response, then sends the next one
+/// Run the complete traceroute process using 0trace technique
+#[allow(clippy::too_many_arguments)]
+async fn run_traceroute(
+    client_id: String,
+    raw_socket_fd: i32,
+    icmp_socket_fd: i32,
+    source_ip: std::net::Ipv4Addr,
+    source_port: u16,
+    dest_ip: std::net::Ipv4Addr,
+    dest_port: u16,
+    max_hops: u8,
+    ttl_timeout: Duration,
+    websocket_writer: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    middleware_channel: Option<MiddlewareChannel>,
+    completion_signal: oneshot::Sender<()>,
+) {
+    eprintln!(
+        "[DEBUG handler] Starting 0trace: {}:{} -> {}:{}",
+        source_ip, source_port, dest_ip, dest_port
+    );
     
-    let (done_tx, done_rx) = oneshot::channel::<()>();
-    let peer_id_clone = peer_id.clone();
-    let middleware_tx_clone = middleware_tx.clone();
-    
-    // Generate a base TCP sequence number for our probe packets
-    let seq_base = (std::time::SystemTime::now()
+    // Generate base sequence number
+    let sequence_base = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() & 0xFFFFFFFF) as u32;
-
     
-    let trace_task = tokio::spawn(async move {
-        // Map to track IP IDs -> (TTL, send_time)
-        let mut probe_map = std::collections::HashMap::new();
+    // Track probes: IP ID -> (TTL, send_time)
+    let mut probe_tracker = std::collections::HashMap::new();
+    
+    // Channels for processing pipeline
+    let (hop_queue_tx, hop_queue_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let (websocket_message_tx, websocket_message_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    
+    // Task to write messages to WebSocket
+    let websocket_writer_task = spawn_websocket_writer_task(websocket_writer, websocket_message_rx);
+    
+    // Task to process hops through middleware
+    let middleware_task = spawn_middleware_processor_task(
+        hop_queue_rx,
+        middleware_channel,
+        websocket_message_tx.clone(),
+    );
+    
+    // STEP 1: Send all probes at once (0trace technique)
+    eprintln!("[DEBUG handler] Sending {} probes (TTL 1-{})", max_hops, max_hops);
+    
+    for ttl in 1..=max_hops {
+        let send_time = Instant::now();
         
-        // Queue for hop messages to process through middleware
-        let (hop_tx, mut hop_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        match send_tcp_probe(
+            raw_socket_fd,
+            source_ip,
+            dest_ip,
+            source_port,
+            dest_port,
+            ttl,
+            sequence_base,
+        ) {
+            Ok(ip_id) => {
+                probe_tracker.insert(ip_id, (ttl, send_time));
+                eprintln!("[DEBUG handler] Sent probe TTL={}, IP_ID={}", ttl, ip_id);
+            }
+            Err(e) => {
+                eprintln!("[DEBUG handler] Failed to send probe TTL={}: {}", ttl, e);
+            }
+        }
         
-        // Create channel for writing to WebSocket
-        let (ws_msg_tx, mut ws_msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::time::sleep(Duration::from_micros(PROBE_SEND_DELAY_MICROS)).await;
+    }
+    
+    // STEP 2: Collect ICMP responses
+    eprintln!(
+        "[DEBUG handler] All probes sent, collecting {} ICMP responses",
+        probe_tracker.len()
+    );
+    
+    let collection_deadline = Instant::now() + ttl_timeout * COLLECTION_TIMEOUT_MULTIPLIER;
+    let total_probes = probe_tracker.len();
+    
+    while !probe_tracker.is_empty() && Instant::now() < collection_deadline {
+        let expected_ids: std::collections::HashMap<u16, u8> = probe_tracker
+            .iter()
+            .map(|(ip_id, (ttl, _))| (*ip_id, *ttl))
+            .collect();
         
-        // Task to write messages to WebSocket
-        let ws_writer_task = {
-            let mut ws_writer_clone = ws_writer;
-            tokio::spawn(async move {
-                while let Some(json_str) = ws_msg_rx.recv().await {
-                    eprintln!("[DEBUG handler] Sending to WebSocket: {}", json_str);
-                    let _ = ws_writer_clone.send(Message::Text(json_str)).await;
-                }
-                ws_writer_clone
-            })
-        };
+        let remaining_time = collection_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(500) as u64;
         
-        // Task to process hop queue through middleware (non-blocking)
-        let middleware_task = {
-            let middleware_tx = middleware_tx_clone.clone();
-            let ws_msg_tx_clone = ws_msg_tx.clone();
-            tokio::spawn(async move {
-                while let Some(hop_msg) = hop_rx.recv().await {
-                    let json_str = serde_json::to_string(&hop_msg).unwrap();
+        if remaining_time == 0 {
+            break;
+        }
+        
+        match poll_icmp_responses(icmp_socket_fd, &expected_ids, remaining_time).await {
+            Ok(Some((ip_id, hop_info))) => {
+                if let Some((ttl, send_time)) = probe_tracker.remove(&ip_id) {
+                    let rtt_ms = send_time.elapsed().as_secs_f64() * 1000.0;
                     
-                    // If middleware is provided, send to it (non-blocking)
-                    if let Some(ref mw_tx) = middleware_tx {
-                        eprintln!("[DEBUG handler] Requesting Promise from middleware: {}", json_str);
-                        
-                        // Create channel to receive Promise
-                        let (promise_tx, mut promise_rx) = tokio::sync::mpsc::unbounded_channel();
-                        
-                        // Send request for Promise
-                        if mw_tx.send((json_str.clone(), promise_tx)).is_err() {
-                            eprintln!("[DEBUG handler] Middleware channel closed, sending original");
-                            let _ = ws_msg_tx_clone.send(json_str);
-                            continue;
-                        }
-                        
-                        // Wait for Promise (non-blocking receive)
-                        let ws_tx_for_promise = ws_msg_tx_clone.clone();
-                        let hop_json_for_fallback = json_str.clone();
-                        tokio::spawn(async move {
-                            match promise_rx.recv().await {
-                                Some(promise) => {
-                                    eprintln!("[DEBUG handler] Got Promise, awaiting...");
-                                    match promise.await {
-                                        Ok(enriched) => {
-                                            eprintln!("[DEBUG handler] Promise resolved!");
-                                            let _ = ws_tx_for_promise.send(enriched);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[DEBUG handler] Promise rejected: {:?}", e);
-                                            let _ = ws_tx_for_promise.send(hop_json_for_fallback);
-                                        }
-                                    }
-                                }
-                                None => {
-                                    eprintln!("[DEBUG handler] Promise channel closed");
-                                    let _ = ws_tx_for_promise.send(hop_json_for_fallback);
-                                }
-                            }
-                        });
-                    } else {
-                        // No middleware, send original directly
-                        eprintln!("[DEBUG handler] No middleware, sending original");
-                        let _ = ws_msg_tx_clone.send(json_str);
-                    }
+                    eprintln!(
+                        "[DEBUG handler] Response for TTL={}: {} ({:.2}ms) [{}/{}]",
+                        ttl,
+                        hop_info.router_ip,
+                        rtt_ms,
+                        total_probes - probe_tracker.len(),
+                        total_probes
+                    );
+                    
+                    process_hop_response(
+                        &client_id,
+                        ttl,
+                        hop_info,
+                        rtt_ms,
+                        &hop_queue_tx,
+                    );
                 }
+            }
+            Ok(None) => {
+                // Timeout - continue
+            }
+            Err(e) => {
+                eprintln!("[DEBUG handler] ICMP poll error: {}", e);
+            }
+        }
+    }
+    
+    // Report timeouts for remaining probes
+    for (_ip_id, (ttl, _)) in probe_tracker {
+        eprintln!("[DEBUG handler] Timeout for TTL={}", ttl);
+        let _ = hop_queue_tx.send(serde_json::json!({
+            "type": "hop",
+            "ttl": ttl,
+            "timeout": true
+        }));
+    }
+    
+    // Cleanup and wait for all tasks
+    drop(hop_queue_tx);
+    let _ = middleware_task.await;
+    
+    drop(websocket_message_tx);
+    let mut websocket_writer = websocket_writer_task.await.unwrap();
+    
+    let _ = websocket_writer
+        .send(Message::Text(
+            r#"{"type":"clientDone","message":"zerotrace done"}"#.into(),
+        ))
+        .await;
+    
+    let _ = completion_signal.send(());
+}
+
+/// Process a hop response and queue it for middleware
+fn process_hop_response(
+    client_id: &str,
+    ttl: u8,
+    hop_info: crate::icmp::HopInfo,
+    rtt_ms: f64,
+    hop_queue: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) {
+    // Emit event
+    let modifications_opt = if hop_info.modifications.ttl_modified
+        || hop_info.modifications.flags_modified
+        || hop_info.modifications.options_stripped
+        || hop_info.modifications.tcp_flags_modified
+        || !hop_info.modifications.modifications.is_empty()
+    {
+        Some(hop_info.modifications.clone())
+    } else {
+        None
+    };
+    
+    let hop = Hop {
+        client_id: client_id.to_string(),
+        ttl,
+        router: hop_info.router_ip.clone(),
+        rtt_ms,
+        modifications: modifications_opt.clone(),
+    };
+    
+    event_bus().emit("hop", &serde_json::to_value(&hop).unwrap());
+    
+    // Prepare JSON for WebSocket
+    let mpls_json: Vec<serde_json::Value> = hop_info
+        .mpls_labels
+        .iter()
+        .map(|label| {
+            serde_json::json!({
+                "label": label.label,
+                "exp": label.experimental_bits,
+                "ttl": label.ttl
             })
-        };
-        
-        // Get the fd values from the Arc/Mutex
-        let raw_fd = match *raw_fd_arc.lock().unwrap() {
-            Some(fd) => fd,
-            None => {
-                eprintln!("[DEBUG handler] Raw socket already closed");
-                return;
-            }
-        };
-        let icmp_fd = match *icmp_fd_arc.lock().unwrap() {
-            Some(fd) => fd,
-            None => {
-                eprintln!("[DEBUG handler] ICMP socket already closed");
-                return;
-            }
-        };
-        
-        eprintln!("[DEBUG handler] === 0trace: Sending ALL probes (TTL 1-{}) ===", max_hops);        // STEP 1: Send all probe packets at once (0trace technique)
-        for ttl in 1..=max_hops {
-            let seq = seq_base.wrapping_add(ttl as u32);
-            let send_at = tokio::time::Instant::now();
-            
-            match send_tcp_probe(
-                raw_fd,
-                trace_params.0,   // src_ip (our server)
-                trace_params.2,   // dst_ip (real client)
-                trace_params.1,   // src_port
-                trace_params.3,   // dst_port
-                seq,
-                ttl,
-            ) {
-                Ok(ip_id) => {
-                    probe_map.insert(ip_id, (ttl, send_at));
-                    eprintln!("[DEBUG handler] Sent probe TTL={}, IP_ID={}", ttl, ip_id);
-                }
-                Err(e) => {
-                    eprintln!("[DEBUG handler] Failed to send probe TTL={}: {}", ttl, e);
-                }
-            }
-            
-            // Small delay between sends to avoid overwhelming the network
-            tokio::time::sleep(Duration::from_micros(100)).await;
-        }
-        
-        eprintln!("[DEBUG handler] === All {} probes sent, collecting ICMP responses ===", probe_map.len());
-        
-        // STEP 2: Collect ICMP responses for all probes (true 0trace approach)
-        // We read ICMP packets and check if they match ANY of our expected IP IDs
-        let collection_deadline = tokio::time::Instant::now() + ttl_timeout * 3;
-        let total_probes = probe_map.len();
-        
-        while !probe_map.is_empty() && tokio::time::Instant::now() < collection_deadline {
-            // Build map of all IP IDs -> TTL we're still waiting for
-            let expected_ids: std::collections::HashMap<u16, u8> = probe_map
-                .iter()
-                .map(|(ip_id, (ttl, _))| (*ip_id, *ttl))
-                .collect();
-            
-            let remaining_time_ms = collection_deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .as_millis()
-                .min(500) as u64; // Check every 500ms max
-            
-            if remaining_time_ms == 0 {
-                break;
-            }
-            
-            // Poll for ANY ICMP response matching our probes
-            match poll_icmp_any(icmp_fd, &expected_ids, remaining_time_ms).await {
-                Ok(Some((ip_id, hop_info))) => {
-                    // Found a response! Remove from pending and report
-                    if let Some((ttl, send_at)) = probe_map.remove(&ip_id) {
-                        let rtt_ms = send_at.elapsed().as_secs_f64() * 1000.0;
-                        eprintln!("[DEBUG handler] Got response for TTL={}: router {}, RTT: {:.2}ms ({}/{} responses)", 
-                            ttl, hop_info.router_ip, rtt_ms, total_probes - probe_map.len(), total_probes);
-                        
-                        // Prepare modifications for JSON (only if any were detected)
-                        let modifications_opt = if hop_info.modifications.ttl_modified 
-                            || hop_info.modifications.flags_modified 
-                            || hop_info.modifications.options_stripped 
-                            || hop_info.modifications.tcp_flags_modified 
-                            || !hop_info.modifications.modifications.is_empty() {
-                            Some(hop_info.modifications.clone())
-                        } else {
-                            None
-                        };
-                        
-                        let hop = Hop {
-                            client_id: peer_id_clone.clone(),
-                            ttl,
-                            router: hop_info.router_ip.clone(),
-                            rtt_ms,
-                            modifications: modifications_opt.clone(),
-                        };
-                        let payload = serde_json::to_value(&hop).unwrap();
-                        event_bus().emit("hop", &payload);
-                        
-                        // Send hop to client with MPLS labels and packet modifications
-                        let mpls_json: Vec<serde_json::Value> = hop_info.mpls_labels.iter().map(|l| {
-                            serde_json::json!({
-                                "label": l.label,
-                                "exp": l.exp,
-                                "ttl": l.ttl
-                            })
-                        }).collect();
-                        
-                        let modifications_json = if let Some(ref mods) = modifications_opt {
-                            serde_json::json!({
-                                "ttl_modified": mods.ttl_modified,
-                                "flags_modified": mods.flags_modified,
-                                "options_stripped": mods.options_stripped,
-                                "tcp_flags_modified": mods.tcp_flags_modified,
-                                "modifications": mods.modifications
-                            })
-                        } else {
-                            serde_json::Value::Null
-                        };
-                        
-                        let hop_msg = serde_json::json!({
-                            "type": "hop",
-                            "clientId": peer_id_clone.clone(),
-                            "ttl": ttl,
-                            "ip": hop_info.router_ip,
-                            "router": hop_info.router_ip,
-                            "rtt_ms": rtt_ms,
-                            "mpls": mpls_json,
-                            "modifications": modifications_json
-                        });
-                        
-                        // Queue the hop message for middleware processing
-                        eprintln!("[DEBUG handler] Queueing hop for middleware: TTL={}", ttl);
-                        let _ = hop_tx.send(hop_msg);
-                    }
-                }
-                Ok(None) => {
-                    // Timeout, no ICMP received in this iteration
-                    eprintln!("[DEBUG handler] No ICMP received in this iteration, {} probes still pending", probe_map.len());
-                }
-                Err(e) => {
-                    eprintln!("[DEBUG handler] Error polling ICMP: {}", e);
-                }
-            }
-        }
-        
-        // Report any probes that never got a response
-        for (_ip_id, (ttl, _)) in probe_map {
-            eprintln!("[DEBUG handler] Timeout for TTL={}", ttl);
-            let timeout_msg = serde_json::json!({
-                "type": "hop",
-                "ttl": ttl,
-                "timeout": true
-            });
-            let _ = hop_tx.send(timeout_msg);
-        }
-
-        // Close the hop queue - no more hops will be sent
-        drop(hop_tx);
-        
-        // Wait for middleware task to finish processing all queued hops
-        let _ = middleware_task.await;
-        
-        // Close ws_msg channel - no more messages
-        drop(ws_msg_tx);
-        
-        // Wait for all WebSocket messages to be sent
-        let mut ws_writer = ws_writer_task.await.unwrap();
-        
-        let _ = ws_writer
-            .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
-            .await;
-        
-        // Clean up sockets - take ownership from Arc to ensure proper cleanup
-        if let Some(fd) = raw_fd_arc.lock().unwrap().take() {
-            unsafe { libc::close(fd); }
-            eprintln!("[DEBUG handler] Closed raw socket");
-        }
-        if let Some(fd) = icmp_fd_arc.lock().unwrap().take() {
-            unsafe { libc::close(fd); }
-            eprintln!("[DEBUG handler] Closed ICMP socket");
-        }
-        
-        let _ = done_tx.send(());
+        })
+        .collect();
+    
+    let modifications_json = modifications_opt.map(|mods| {
+        serde_json::json!({
+            "ttl_modified": mods.ttl_modified,
+            "flags_modified": mods.flags_modified,
+            "options_stripped": mods.options_stripped,
+            "tcp_flags_modified": mods.tcp_flags_modified,
+            "modifications": mods.modifications
+        })
     });
+    
+    let hop_message = serde_json::json!({
+        "type": "hop",
+        "clientId": client_id,
+        "ttl": ttl,
+        "ip": hop_info.router_ip,
+        "router": hop_info.router_ip,
+        "rtt_ms": rtt_ms,
+        "mpls": mpls_json,
+        "modifications": modifications_json
+    });
+    
+    let _ = hop_queue.send(hop_message);
+}
 
-    // Wait for client to send start message with target
-    let read_task = tokio::spawn(async move {
-        while let Some(msg) = ws_reader.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    eprintln!("[DEBUG handler] Received message: {}", text);
-                    // Expected format: {"target":"8.8.8.8","port":80}
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let (Some(target), Some(port)) = (json.get("target"), json.get("port")) {
-                            if let (Some(target_str), Some(port_num)) = (target.as_str(), port.as_u64()) {
-                                eprintln!("[DEBUG handler] Got target: {}:{}", target_str, port_num);
-                                // TODO: Send this to trace_task via channel
+/// Spawn task to write messages to WebSocket
+fn spawn_websocket_writer_task(
+    mut writer: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    mut message_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> tokio::task::JoinHandle<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>> {
+    tokio::spawn(async move {
+        while let Some(json_str) = message_rx.recv().await {
+            let _ = writer.send(Message::Text(json_str)).await;
+        }
+        writer
+    })
+}
+
+/// Spawn task to process hops through middleware
+fn spawn_middleware_processor_task(
+    mut hop_queue: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    middleware_channel: Option<MiddlewareChannel>,
+    websocket_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(hop_message) = hop_queue.recv().await {
+            let json_str = serde_json::to_string(&hop_message).unwrap();
+            
+            if let Some(ref middleware_tx) = middleware_channel {
+                // Request Promise from middleware
+                let (promise_tx, mut promise_rx) = tokio::sync::mpsc::unbounded_channel();
+                
+                if middleware_tx.send((json_str.clone(), promise_tx)).is_err() {
+                    let _ = websocket_tx.send(json_str);
+                    continue;
+                }
+                
+                // Await Promise in separate task
+                let ws_tx = websocket_tx.clone();
+                let fallback_json = json_str;
+                tokio::spawn(async move {
+                    match promise_rx.recv().await {
+                        Some(promise) => match promise.await {
+                            Ok(enriched) => {
+                                let _ = ws_tx.send(enriched);
                             }
+                            Err(_) => {
+                                let _ = ws_tx.send(fallback_json);
+                            }
+                        },
+                        None => {
+                            let _ = ws_tx.send(fallback_json);
                         }
                     }
-                }
-                Ok(Message::Pong(_)) => {
-                    // ignore; tungstenite handles pings/pongs
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(_other) => { /* ignore */ }
-                Err(_e) => break,
+                });
+            } else {
+                let _ = websocket_tx.send(json_str);
             }
         }
-    });
+    })
+}
 
-    let _ = done_rx.await;
-    let _ = trace_task.await;
-    let _ = read_task.await;
-
-    // Final cleanup - ensure sockets are closed even if tasks failed
-    if let Some(fd) = raw_fd_cleanup.lock().unwrap().take() {
-        unsafe { libc::close(fd); }
-        eprintln!("[DEBUG handler] Final cleanup: closed raw socket");
+/// Handle incoming WebSocket messages from client
+async fn handle_websocket_messages(
+    mut reader: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>,
+) {
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                eprintln!("[DEBUG handler] Received message: {}", text);
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
     }
-    if let Some(fd) = icmp_fd_cleanup.lock().unwrap().take() {
-        unsafe { libc::close(fd); }
-        eprintln!("[DEBUG handler] Final cleanup: closed ICMP socket");
-    }
+}
 
-    event_bus().emit("clientDone", &serde_json::json!({ "clientId": peer_id }));
+/// Cleanup network sockets
+fn cleanup_sockets(raw_socket_fd: i32, icmp_socket_fd: i32) {
+    unsafe {
+        libc::close(raw_socket_fd);
+        libc::close(icmp_socket_fd);
+    }
+    eprintln!("[DEBUG handler] Closed network sockets");
 }

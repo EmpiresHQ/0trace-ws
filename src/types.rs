@@ -29,22 +29,12 @@ pub struct Hop {
     pub modifications: Option<PacketModifications>,
 }
 
-/// Request to enrich hop data via middleware
-/// Contains Promise that will resolve to enriched JSON
-pub struct MiddlewareRequest {
-    pub promise: napi::bindgen_prelude::Promise<String>,
-    pub hop_json: String,
-    pub ws_tx: tokio::sync::mpsc::UnboundedSender<String>,
-}
-
 pub struct ServerTask {
     pub host: String,
     pub port: u16,
     pub max_hops: u32,
     pub per_ttl: u32,
     pub shutdown_tx: broadcast::Sender<()>,
-    // Channel to request Promise: send (hop_json, promise_tx)
-    pub middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
 }
 
 #[napi(object)]
@@ -54,7 +44,8 @@ pub struct ServerOptions {
     pub max_hops: Option<u32>,
     pub per_ttl_timeout_ms: Option<u32>,
     pub iface_hint: Option<String>,
-    pub middleware: Option<napi::JsFunction>,
+    // Middleware is called on JS side and returns Promise<String>
+    // We don't need to store the function itself
 }
 
 #[napi]
@@ -88,7 +79,6 @@ impl Server {
             task.max_hops,
             task.per_ttl,
             task.shutdown_tx,
-            task.middleware_tx,
         ));
 
         Ok(())
