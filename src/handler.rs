@@ -232,6 +232,65 @@ pub async fn handle_client(
         // Map to track IP IDs -> (TTL, send_time)
         let mut probe_map = std::collections::HashMap::new();
         
+        // Queue for hop messages to process through middleware
+        let (hop_tx, mut hop_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        
+        // Spawn task to process hop queue through middleware
+        let middleware_task = {
+            let middleware = middleware_clone.clone();
+            let mut ws_writer_clone = ws_writer;
+            tokio::spawn(async move {
+                while let Some(hop_msg) = hop_rx.recv().await {
+                    // If middleware is provided, call it to enrich the data
+                    if let Some(ref mw) = middleware {
+                        let json_str = serde_json::to_string(&hop_msg).unwrap();
+                        eprintln!("[DEBUG handler] Calling middleware with: {}", json_str);
+                        
+                        // Create a channel to receive enriched data from the next() callback
+                        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+                        
+                        // Create middleware context
+                        let ctx = crate::types::MiddlewareContext {
+                            json_data: json_str.clone(),
+                            sender,
+                        };
+                        
+                        // Call middleware - it will receive (hop_object, next_callback)
+                        // Middleware returns a Promise and calls next(enriched_object)
+                        mw.call(
+                            ctx,
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                        
+                        eprintln!("[DEBUG handler] Middleware called, waiting for response...");
+                        
+                        // Wait for enriched data from middleware Promise with timeout
+                        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+                            Ok(Ok(enriched)) => {
+                                eprintln!("[DEBUG handler] Middleware enriched data received");
+                                let _ = ws_writer_clone.send(Message::Text(enriched)).await;
+                            }
+                            Ok(Err(_)) => {
+                                eprintln!("[DEBUG handler] Middleware channel closed, using original");
+                                let _ = ws_writer_clone.send(Message::Text(json_str)).await;
+                            }
+                            Err(_) => {
+                                eprintln!("[DEBUG handler] Middleware timeout (2s), using original");
+                                let _ = ws_writer_clone.send(Message::Text(json_str)).await;
+                            }
+                        }
+                    } else {
+                        // No middleware, send original
+                        eprintln!("[DEBUG handler] No middleware, sending original");
+                        let json_str = serde_json::to_string(&hop_msg).unwrap();
+                        let _ = ws_writer_clone.send(Message::Text(json_str)).await;
+                    }
+                }
+                ws_writer_clone
+            })
+        };
+        
         // Get the fd values from the Arc/Mutex
         let raw_fd = match *raw_fd_arc.lock().unwrap() {
             Some(fd) => fd,
@@ -360,51 +419,9 @@ pub async fn handle_client(
                             "modifications": modifications_json
                         });
                         
-                        // If middleware is provided, call it to enrich the data
-                        if let Some(ref mw) = middleware_clone {
-                            let json_str = serde_json::to_string(&hop_msg).unwrap();
-                            eprintln!("[DEBUG handler] Calling middleware with: {}", json_str);
-                            
-                            // Create a channel to receive enriched data from the next() callback
-                            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-                            let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
-                            
-                            // Create middleware context
-                            let ctx = crate::types::MiddlewareContext {
-                                json_data: json_str.clone(),
-                                sender,
-                            };
-                            
-                            // Call middleware - it will receive (hop_object, next_callback)
-                            // Middleware returns a Promise and calls next(enriched_object)
-                            mw.call(
-                                ctx,
-                                napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-                            
-                            eprintln!("[DEBUG handler] Middleware called, waiting for response...");
-                            
-                            // Wait for enriched data from middleware Promise with timeout
-                            match tokio::time::timeout(Duration::from_secs(2), rx).await {
-                                Ok(Ok(enriched)) => {
-                                    eprintln!("[DEBUG handler] Middleware enriched data received");
-                                    let _ = ws_writer.send(Message::Text(enriched)).await;
-                                }
-                                Ok(Err(_)) => {
-                                    eprintln!("[DEBUG handler] Middleware channel closed, using original");
-                                    let _ = ws_writer.send(Message::Text(json_str)).await;
-                                }
-                                Err(_) => {
-                                    eprintln!("[DEBUG handler] Middleware timeout (2s), using original");
-                                    let _ = ws_writer.send(Message::Text(json_str)).await;
-                                }
-                            }
-                        } else {
-                            // No middleware, send original
-                            eprintln!("[DEBUG handler] No middleware, sending original");
-                            let json_str = serde_json::to_string(&hop_msg).unwrap();
-                            let _ = ws_writer.send(Message::Text(json_str)).await;
-                        }
+                        // Queue the hop message for middleware processing
+                        eprintln!("[DEBUG handler] Queueing hop for middleware: TTL={}", ttl);
+                        let _ = hop_tx.send(hop_msg);
                     }
                 }
                 Ok(None) => {
@@ -420,14 +437,20 @@ pub async fn handle_client(
         // Report any probes that never got a response
         for (_ip_id, (ttl, _)) in probe_map {
             eprintln!("[DEBUG handler] Timeout for TTL={}", ttl);
-            let _ = ws_writer
-                .send(Message::Text(format!(
-                    r#"{{"type":"hop","ttl":{},"timeout":true}}"#,
-                    ttl
-                )))
-                .await;
+            let timeout_msg = serde_json::json!({
+                "type": "hop",
+                "ttl": ttl,
+                "timeout": true
+            });
+            let _ = hop_tx.send(timeout_msg);
         }
 
+        // Close the hop queue - no more hops will be sent
+        drop(hop_tx);
+        
+        // Wait for middleware task to finish processing all queued hops
+        let mut ws_writer = middleware_task.await.unwrap();
+        
         let _ = ws_writer
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
             .await;
