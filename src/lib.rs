@@ -29,7 +29,7 @@ fn handle_middleware_request(
     eprintln!("[DEBUG lib] Middleware TSFN called");
     let req = ctx.value;
     let hop_json = req.hop_json.clone();
-    let response_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(req.response_tx)));
+    let ws_tx = req.ws_tx;
     
     // Parse JSON to object
     let global = ctx.env.get_global()?;
@@ -54,22 +54,18 @@ fn handle_middleware_request(
     
     eprintln!("[DEBUG lib] Got Promise<String>, spawning tokio task to await");
     
-    // Spawn tokio task to await the Promise
+    // Promise<T> is Send, so we can pass it directly to tokio::spawn
     tokio::spawn(async move {
         eprintln!("[DEBUG lib] Awaiting Promise...");
         
         match promise.await {
             Ok(enriched_json) => {
-                eprintln!("[DEBUG lib] Promise resolved! Got JSON string");
-                if let Some(tx) = response_tx.lock().unwrap().take() {
-                    let _ = tx.send(enriched_json);
-                }
+                eprintln!("[DEBUG lib] Promise resolved! Sending to WebSocket");
+                let _ = ws_tx.send(enriched_json);
             }
             Err(e) => {
-                eprintln!("[DEBUG lib] Promise rejected: {:?}", e);
-                if let Some(tx) = response_tx.lock().unwrap().take() {
-                    let _ = tx.send(hop_json);
-                }
+                eprintln!("[DEBUG lib] Promise rejected: {:?}, sending original", e);
+                let _ = ws_tx.send(hop_json);
             }
         }
     });

@@ -32,7 +32,7 @@ pub struct Hop {
 /// Request to enrich hop data via middleware
 pub struct MiddlewareRequest {
     pub hop_json: String,
-    pub response_tx: tokio::sync::oneshot::Sender<String>,
+    pub ws_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 pub struct ServerTask {

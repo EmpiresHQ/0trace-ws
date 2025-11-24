@@ -235,53 +235,50 @@ pub async fn handle_client(
         // Queue for hop messages to process through middleware
         let (hop_tx, mut hop_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
         
-        // Spawn task to process hop queue through middleware
-        let middleware_task = {
-            let middleware_tx = middleware_tx_clone.clone();
+        // Create channel for writing to WebSocket
+        let (ws_msg_tx, mut ws_msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        
+        // Task to write messages to WebSocket
+        let ws_writer_task = {
             let mut ws_writer_clone = ws_writer;
             tokio::spawn(async move {
+                while let Some(json_str) = ws_msg_rx.recv().await {
+                    eprintln!("[DEBUG handler] Sending to WebSocket: {}", json_str);
+                    let _ = ws_writer_clone.send(Message::Text(json_str)).await;
+                }
+                ws_writer_clone
+            })
+        };
+        
+        // Task to process hop queue through middleware (non-blocking)
+        let middleware_task = {
+            let middleware_tx = middleware_tx_clone.clone();
+            let ws_msg_tx_clone = ws_msg_tx.clone();
+            tokio::spawn(async move {
                 while let Some(hop_msg) = hop_rx.recv().await {
-                    // If middleware is provided, call it to enrich the data
+                    let json_str = serde_json::to_string(&hop_msg).unwrap();
+                    
+                    // If middleware is provided, send to it (non-blocking)
                     if let Some(ref mw_tx) = middleware_tx {
-                        let json_str = serde_json::to_string(&hop_msg).unwrap();
-                        eprintln!("[DEBUG handler] Sending to middleware: {}", json_str);
+                        eprintln!("[DEBUG handler] Queueing to middleware: {}", json_str);
                         
-                        // Create channel to receive enriched data
-                        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<String>();
-                        
-                        // Send request to middleware handler
+                        // Send request to middleware handler with ws channel
                         let req = crate::types::MiddlewareRequest {
                             hop_json: json_str.clone(),
-                            response_tx,
+                            ws_tx: ws_msg_tx_clone.clone(),
                         };
                         
                         if mw_tx.send(req).is_err() {
-                            eprintln!("[DEBUG handler] Middleware channel closed, using original");
-                            let _ = ws_writer_clone.send(Message::Text(json_str)).await;
-                            continue;
+                            eprintln!("[DEBUG handler] Middleware channel closed, sending original");
+                            let _ = ws_msg_tx_clone.send(json_str);
                         }
-                        
-                        eprintln!("[DEBUG handler] Waiting for enriched data...");
-                        
-                        // Wait for enriched data
-                        match response_rx.await {
-                            Ok(enriched) => {
-                                eprintln!("[DEBUG handler] Got enriched data");
-                                let _ = ws_writer_clone.send(Message::Text(enriched)).await;
-                            }
-                            Err(_) => {
-                                eprintln!("[DEBUG handler] Middleware response failed, using original");
-                                let _ = ws_writer_clone.send(Message::Text(json_str)).await;
-                            }
-                        }
+                        // Don't wait! Middleware will write to ws_tx when ready
                     } else {
-                        // No middleware, send original
+                        // No middleware, send original directly
                         eprintln!("[DEBUG handler] No middleware, sending original");
-                        let json_str = serde_json::to_string(&hop_msg).unwrap();
-                        let _ = ws_writer_clone.send(Message::Text(json_str)).await;
+                        let _ = ws_msg_tx_clone.send(json_str);
                     }
                 }
-                ws_writer_clone
             })
         };
         
@@ -443,7 +440,13 @@ pub async fn handle_client(
         drop(hop_tx);
         
         // Wait for middleware task to finish processing all queued hops
-        let mut ws_writer = middleware_task.await.unwrap();
+        let _ = middleware_task.await;
+        
+        // Close ws_msg channel - no more messages
+        drop(ws_msg_tx);
+        
+        // Wait for all WebSocket messages to be sent
+        let mut ws_writer = ws_writer_task.await.unwrap();
         
         let _ = ws_writer
             .send(Message::Text(r#"{"type":"clientDone","message":"zerotrace done"}"#.into()))
