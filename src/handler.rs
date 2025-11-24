@@ -32,6 +32,7 @@ pub async fn handle_client(
     peer: SocketAddr,
     max_hops: u8,
     ttl_timeout: Duration,
+    middleware: Option<crate::types::MiddlewareFunction>,
 ) {
     let peer_id = format!("{}", peer);
     
@@ -218,6 +219,7 @@ pub async fn handle_client(
     
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let peer_id_clone = peer_id.clone();
+    let middleware_clone = middleware.clone();
     
     // Generate a base TCP sequence number for our probe packets
     let seq_base = (std::time::SystemTime::now()
@@ -357,9 +359,45 @@ pub async fn handle_client(
                             "mpls": mpls_json,
                             "modifications": modifications_json
                         });
-                        let _ = ws_writer
-                            .send(Message::Text(serde_json::to_string(&hop_msg).unwrap()))
-                            .await;
+                        
+                        // If middleware is provided, call it to enrich the data
+                        if let Some(ref mw) = middleware_clone {
+                            let json_str = serde_json::to_string(&hop_msg).unwrap();
+                            eprintln!("[DEBUG handler] Calling middleware with: {}", json_str);
+                            
+                            // Create a channel to receive enriched data from the next() callback
+                            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                            let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+                            
+                            // Create middleware context
+                            let ctx = crate::types::MiddlewareContext {
+                                json_data: json_str.clone(),
+                                sender,
+                            };
+                            
+                            // Call middleware - it will receive (hop_object, next_callback)
+                            // Middleware returns a Promise and calls next(enriched_object)
+                            mw.call(
+                                ctx,
+                                napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+                            
+                            // Wait for enriched data from middleware Promise
+                            match rx.await {
+                                Ok(enriched) => {
+                                    eprintln!("[DEBUG handler] Middleware enriched data received");
+                                    let _ = ws_writer.send(Message::Text(enriched)).await;
+                                }
+                                Err(_) => {
+                                    eprintln!("[DEBUG handler] Middleware channel closed, using original");
+                                    let _ = ws_writer.send(Message::Text(json_str)).await;
+                                }
+                            }
+                        } else {
+                            // No middleware, send original
+                            let json_str = serde_json::to_string(&hop_msg).unwrap();
+                            let _ = ws_writer.send(Message::Text(json_str)).await;
+                        }
                     }
                 }
                 Ok(None) => {

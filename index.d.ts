@@ -9,6 +9,7 @@ export interface ServerOptions {
   maxHops?: number
   perTtlTimeoutMs?: number
   ifaceHint?: string
+  middleware?: (...args: any[]) => any
 }
 export declare function startServer(opts: ServerOptions): Server
 export declare class Server {

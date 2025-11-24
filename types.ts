@@ -4,6 +4,7 @@ export interface ServerConfig {
   port: number;
   maxHops?: number;
   perTtlTimeoutMs?: number;
+  middleware?: (hopData: any, next: (enrichedData: any) => void) => void | Promise<void>;
 }
 
 export interface HopEvent {

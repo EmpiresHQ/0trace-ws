@@ -1,5 +1,6 @@
 import { startServer } from './index.js';
 import type { HopEvent, ClientConnectedEvent, ClientDoneEvent, ErrorEvent } from './types.js';
+import { geoipMiddleware } from './geoip-middleware.js';
 
 const WS_PORT = Number(process.env.WS_PORT) || 8080;
 const MAX_HOPS = Number(process.env.MAX_HOPS) || 30;
@@ -17,24 +18,26 @@ process.on('unhandledRejection', (reason, promise) => {
   // Don't exit - let the server continue running
 });
 
-console.log('Starting WebSocket server...');
+console.log('Starting WebSocket server with GeoIP enrichment middleware...');
 console.log('Port:', WS_PORT);
 console.log('Max hops:', MAX_HOPS);
 console.log('Timeout per TTL:', TIMEOUT_MS, 'ms');
 
-// Start WebSocket server
+// Start WebSocket server with GeoIP middleware
 const wsServer = startServer({
   port: WS_PORT,
   maxHops: MAX_HOPS,
-  perTtlTimeoutMs: TIMEOUT_MS
+  perTtlTimeoutMs: TIMEOUT_MS,
+  middleware: geoipMiddleware  // Pass the middleware function
 });
 
 wsServer.on('clientConnected', (e: ClientConnectedEvent) => {
   console.log('[WS] Client connected:', e);
 });
 
-wsServer.on('hop', (h: HopEvent) => {
+wsServer.on('hop', async (h: HopEvent) => {
   console.log('[WS] Hop detected:', h);
+  // Hop data is already enriched by middleware before being sent to client
 });
 
 wsServer.on('clientDone', (e: ClientDoneEvent) => {

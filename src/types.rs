@@ -1,6 +1,9 @@
 use serde::Serialize;
 use napi_derive::napi;
 use tokio::sync::broadcast;
+use napi::threadsafe_function::{ThreadsafeFunction, ErrorStrategy};
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 /// Information about packet modifications detected in ICMP response
 #[derive(Serialize, Clone, Debug, Default)]
@@ -29,12 +32,23 @@ pub struct Hop {
     pub modifications: Option<PacketModifications>,
 }
 
+/// Context passed to middleware containing JSON data and sender for enriched data
+pub struct MiddlewareContext {
+    pub json_data: String,
+    pub sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+}
+
+/// Middleware receives MiddlewareContext
+/// JS middleware should return Promise that resolves with enriched data
+pub type MiddlewareFunction = ThreadsafeFunction<MiddlewareContext, ErrorStrategy::Fatal>;
+
 pub struct ServerTask {
     pub host: String,
     pub port: u16,
     pub max_hops: u32,
     pub per_ttl: u32,
     pub shutdown_tx: broadcast::Sender<()>,
+    pub middleware: Option<MiddlewareFunction>,
 }
 
 #[napi(object)]
@@ -44,6 +58,7 @@ pub struct ServerOptions {
     pub max_hops: Option<u32>,
     pub per_ttl_timeout_ms: Option<u32>,
     pub iface_hint: Option<String>,
+    pub middleware: Option<napi::JsFunction>,
 }
 
 #[napi]
@@ -77,6 +92,7 @@ impl Server {
             task.max_hops,
             task.per_ttl,
             task.shutdown_tx,
+            task.middleware,
         ));
 
         Ok(())

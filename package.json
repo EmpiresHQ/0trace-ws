@@ -12,6 +12,7 @@
     "prebuild:frontend": "mkdir -p dist"
   },
   "dependencies": {
+    "@maxmind/geoip2-node": "^6.3.0",
     "autoprefixer": "^10.4.22",
     "express": "^5.1.0",
     "node-addon-api": "^7.0.0",
