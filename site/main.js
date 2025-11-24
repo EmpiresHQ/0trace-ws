@@ -1,3 +1,5 @@
+import './styles.css';
+
 const WS_URL = __WS_URL__;
 
 const output = document.getElementById('output');
