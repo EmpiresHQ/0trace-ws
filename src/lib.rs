@@ -38,12 +38,34 @@ fn handle_middleware_request(
     let json_str = ctx.env.create_string(&hop_json)?;
     let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
     
-    // Get middleware from global scope
-    let middleware_fn: napi::JsFunction = global.get_named_property("__zerotrace_middleware")?;
+    // Get middleware from global scope (костыль, но работает)
+    let middleware_fn: napi::JsFunction = match global.get_named_property("__zerotrace_middleware") {
+        Ok(f) => {
+            eprintln!("[DEBUG lib] Found __zerotrace_middleware in global");
+            f
+        }
+        Err(e) => {
+            eprintln!("[DEBUG lib] ERROR: Failed to get __zerotrace_middleware: {:?}", e);
+            eprintln!("[DEBUG lib] Sending original data");
+            let _ = ws_tx.send(hop_json);
+            return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
+        }
+    };
     
     // Call middleware with hop object - it returns Promise<String>
     eprintln!("[DEBUG lib] Calling middleware function...");
-    let promise_result = middleware_fn.call(None, &[hop_obj])?;
+    let promise_result = match middleware_fn.call(None, &[hop_obj]) {
+        Ok(r) => {
+            eprintln!("[DEBUG lib] Middleware function called successfully");
+            r
+        }
+        Err(e) => {
+            eprintln!("[DEBUG lib] ERROR: Failed to call middleware: {:?}", e);
+            eprintln!("[DEBUG lib] Sending original data");
+            let _ = ws_tx.send(hop_json);
+            return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
+        }
+    };
     
     // Convert to Promise<String>
     use napi::bindgen_prelude::*;
@@ -60,12 +82,18 @@ fn handle_middleware_request(
         
         match promise.await {
             Ok(enriched_json) => {
-                eprintln!("[DEBUG lib] Promise resolved! Sending to WebSocket");
-                let _ = ws_tx.send(enriched_json);
+                eprintln!("[DEBUG lib] Promise resolved! Got: {}", enriched_json);
+                match ws_tx.send(enriched_json.clone()) {
+                    Ok(_) => eprintln!("[DEBUG lib] Successfully sent to ws_tx channel"),
+                    Err(e) => eprintln!("[DEBUG lib] ERROR: Failed to send to ws_tx: {:?}", e),
+                }
             }
             Err(e) => {
                 eprintln!("[DEBUG lib] Promise rejected: {:?}, sending original", e);
-                let _ = ws_tx.send(hop_json);
+                match ws_tx.send(hop_json.clone()) {
+                    Ok(_) => eprintln!("[DEBUG lib] Successfully sent original to ws_tx"),
+                    Err(e) => eprintln!("[DEBUG lib] ERROR: Failed to send original: {:?}", e),
+                }
             }
         }
     });
