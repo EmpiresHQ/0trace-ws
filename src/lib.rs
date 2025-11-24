@@ -48,6 +48,9 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
                 let json_str = ctx.env.create_string(&hop_json)?;
                 let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
                 
+                // Wrap result_tx in Arc so it can be cloned into the closure
+                let result_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
+                
                 // Create callback function (next) that JS will call with enriched data
                 let next_callback = ctx.env.create_function_from_closure("next", move |ctx| {
                     eprintln!("[DEBUG] next() callback called from JS");
@@ -55,7 +58,11 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
                     eprintln!("[DEBUG] Sending enriched data back to Rust: {}", &enriched_json[..enriched_json.len().min(50)]);
                     
                     // Send enriched data back to Rust
-                    let _ = result_tx.send(enriched_json);
+                    if let Some(tx) = result_tx.lock().unwrap().take() {
+                        let _ = tx.send(enriched_json);
+                    } else {
+                        eprintln!("[DEBUG] next() called multiple times - ignoring");
+                    }
                     
                     ctx.env.get_undefined()
                 })?;
@@ -138,7 +145,7 @@ pub(crate) async fn run_server_loop(
                 
                 // Wait for result from JS with timeout
                 let promise_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(5000),
+                    std::time::Duration::from_millis(1000),  // Reduce timeout to 1s
                     result_rx.recv()
                 ).await;
                 
@@ -147,8 +154,12 @@ pub(crate) async fn run_server_loop(
                         eprintln!("[DEBUG] Got enriched result from JS: {}", &enriched_json[..enriched_json.len().min(50)]);
                         let _ = promise_tx.send(enriched_json);
                     }
-                    Ok(None) | Err(_) => {
-                        eprintln!("[DEBUG] Timeout or error, using fallback");
+                    Ok(None) => {
+                        eprintln!("[DEBUG] Channel closed without result, using fallback");
+                        let _ = promise_tx.send(json_str);
+                    }
+                    Err(_) => {
+                        eprintln!("[DEBUG] Timeout waiting for JS middleware (1s), using fallback");
                         let _ = promise_tx.send(json_str);
                     }
                 }
