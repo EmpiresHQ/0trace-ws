@@ -32,7 +32,7 @@ pub async fn handle_client(
     peer: SocketAddr,
     max_hops: u8,
     ttl_timeout: Duration,
-    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::types::MiddlewareRequest>>,
+    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
 ) {
     let peer_id = format!("{}", peer);
     
@@ -260,19 +260,42 @@ pub async fn handle_client(
                     
                     // If middleware is provided, send to it (non-blocking)
                     if let Some(ref mw_tx) = middleware_tx {
-                        eprintln!("[DEBUG handler] Queueing to middleware: {}", json_str);
+                        eprintln!("[DEBUG handler] Requesting Promise from middleware: {}", json_str);
                         
-                        // Send request to middleware handler with ws channel
-                        let req = crate::types::MiddlewareRequest {
-                            hop_json: json_str.clone(),
-                            ws_tx: ws_msg_tx_clone.clone(),
-                        };
+                        // Create channel to receive Promise
+                        let (promise_tx, mut promise_rx) = tokio::sync::mpsc::unbounded_channel();
                         
-                        if mw_tx.send(req).is_err() {
+                        // Send request for Promise
+                        if mw_tx.send((json_str.clone(), promise_tx)).is_err() {
                             eprintln!("[DEBUG handler] Middleware channel closed, sending original");
                             let _ = ws_msg_tx_clone.send(json_str);
+                            continue;
                         }
-                        // Don't wait! Middleware will write to ws_tx when ready
+                        
+                        // Wait for Promise (non-blocking receive)
+                        let ws_tx_for_promise = ws_msg_tx_clone.clone();
+                        let hop_json_for_fallback = json_str.clone();
+                        tokio::spawn(async move {
+                            match promise_rx.recv().await {
+                                Some(promise) => {
+                                    eprintln!("[DEBUG handler] Got Promise, awaiting...");
+                                    match promise.await {
+                                        Ok(enriched) => {
+                                            eprintln!("[DEBUG handler] Promise resolved!");
+                                            let _ = ws_tx_for_promise.send(enriched);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[DEBUG handler] Promise rejected: {:?}", e);
+                                            let _ = ws_tx_for_promise.send(hop_json_for_fallback);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    eprintln!("[DEBUG handler] Promise channel closed");
+                                    let _ = ws_tx_for_promise.send(hop_json_for_fallback);
+                                }
+                            }
+                        });
                     } else {
                         // No middleware, send original directly
                         eprintln!("[DEBUG handler] No middleware, sending original");

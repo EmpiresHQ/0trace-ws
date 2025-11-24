@@ -22,14 +22,12 @@ pub use types::{Server, ServerOptions};
 // ------------- N-API entry: start_server ---------------------
 
 /// Handle middleware request in JS thread
-/// Calls the middleware function, awaits the Promise, and sends result back
+/// Calls middleware function and returns Promise through channel
 fn handle_middleware_request(
-    ctx: napi::threadsafe_function::ThreadSafeCallContext<types::MiddlewareRequest>,
+    ctx: napi::threadsafe_function::ThreadSafeCallContext<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>,
 ) -> napi::Result<Vec<napi::JsUnknown>> {
     eprintln!("[DEBUG lib] Middleware TSFN called");
-    let req = ctx.value;
-    let hop_json = req.hop_json.clone();
-    let ws_tx = req.ws_tx;
+    let (hop_json, promise_tx) = ctx.value;
     
     // Parse JSON to object
     let global = ctx.env.get_global()?;
@@ -38,7 +36,7 @@ fn handle_middleware_request(
     let json_str = ctx.env.create_string(&hop_json)?;
     let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
     
-    // Get middleware from global scope (костыль, но работает)
+    // Get middleware from global scope
     let middleware_fn: napi::JsFunction = match global.get_named_property("__zerotrace_middleware") {
         Ok(f) => {
             eprintln!("[DEBUG lib] Found __zerotrace_middleware in global");
@@ -46,8 +44,6 @@ fn handle_middleware_request(
         }
         Err(e) => {
             eprintln!("[DEBUG lib] ERROR: Failed to get __zerotrace_middleware: {:?}", e);
-            eprintln!("[DEBUG lib] Sending original data");
-            let _ = ws_tx.send(hop_json);
             return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
         }
     };
@@ -61,8 +57,6 @@ fn handle_middleware_request(
         }
         Err(e) => {
             eprintln!("[DEBUG lib] ERROR: Failed to call middleware: {:?}", e);
-            eprintln!("[DEBUG lib] Sending original data");
-            let _ = ws_tx.send(hop_json);
             return Ok(vec![ctx.env.get_undefined()?.into_unknown()]);
         }
     };
@@ -74,29 +68,10 @@ fn handle_middleware_request(
         Promise::<String>::from_napi_value(ctx.env.raw(), NapiRaw::raw(&promise_result))?
     };
     
-    eprintln!("[DEBUG lib] Got Promise<String>, spawning tokio task to await");
+    eprintln!("[DEBUG lib] Got Promise<String>, sending through channel");
     
-    // Promise<T> is Send, so we can pass it directly to tokio::spawn
-    tokio::spawn(async move {
-        eprintln!("[DEBUG lib] Awaiting Promise...");
-        
-        match promise.await {
-            Ok(enriched_json) => {
-                eprintln!("[DEBUG lib] Promise resolved! Got: {}", enriched_json);
-                match ws_tx.send(enriched_json.clone()) {
-                    Ok(_) => eprintln!("[DEBUG lib] Successfully sent to ws_tx channel"),
-                    Err(e) => eprintln!("[DEBUG lib] ERROR: Failed to send to ws_tx: {:?}", e),
-                }
-            }
-            Err(e) => {
-                eprintln!("[DEBUG lib] Promise rejected: {:?}, sending original", e);
-                match ws_tx.send(hop_json.clone()) {
-                    Ok(_) => eprintln!("[DEBUG lib] Successfully sent original to ws_tx"),
-                    Err(e) => eprintln!("[DEBUG lib] ERROR: Failed to send original: {:?}", e),
-                }
-            }
-        }
-    });
+    // Send Promise through channel (Promise is Send!)
+    let _ = promise_tx.send(promise);
     
     Ok(vec![ctx.env.get_undefined()?.into_unknown()])
 }
@@ -111,20 +86,23 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
     // Create channel for middleware requests if middleware provided
     let middleware_tx = if let Some(js_fn) = opts.middleware {
         eprintln!("[DEBUG lib] Setting up middleware channel");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<types::MiddlewareRequest>();
+        
+        // Channel to send hop_json, receive Promise back
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>();
         
         // Create threadsafe function to call middleware
         let tsfn = js_fn.create_threadsafe_function(0, handle_middleware_request)?;
         
-        // Spawn task to forward requests from channel to TSFN
+        // Spawn thread to forward requests to TSFN
         std::thread::spawn(move || {
             eprintln!("[DEBUG lib] Middleware forwarder thread started");
+            
             loop {
                 match rx.blocking_recv() {
-                    Some(req) => {
+                    Some((hop_json, promise_tx)) => {
                         eprintln!("[DEBUG lib] Forwarding middleware request");
                         use napi::threadsafe_function::{ThreadsafeFunction as TSF, ThreadsafeFunctionCallMode, ErrorStrategy};
-                        TSF::<_, ErrorStrategy::Fatal>::call(&tsfn, req, ThreadsafeFunctionCallMode::NonBlocking);
+                        TSF::<_, ErrorStrategy::Fatal>::call(&tsfn, (hop_json, promise_tx), ThreadsafeFunctionCallMode::NonBlocking);
                     }
                     None => {
                         eprintln!("[DEBUG lib] Middleware channel closed");
@@ -162,7 +140,7 @@ pub(crate) async fn run_server_loop(
     max_hops: u32,
     per_ttl: u32,
     shutdown_tx: broadcast::Sender<()>,
-    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<types::MiddlewareRequest>>,
+    middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
 ) {
     let addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&addr).await {

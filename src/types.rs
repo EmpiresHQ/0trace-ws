@@ -30,7 +30,9 @@ pub struct Hop {
 }
 
 /// Request to enrich hop data via middleware
+/// Contains Promise that will resolve to enriched JSON
 pub struct MiddlewareRequest {
+    pub promise: napi::bindgen_prelude::Promise<String>,
     pub hop_json: String,
     pub ws_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
@@ -41,7 +43,8 @@ pub struct ServerTask {
     pub max_hops: u32,
     pub per_ttl: u32,
     pub shutdown_tx: broadcast::Sender<()>,
-    pub middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<MiddlewareRequest>>,
+    // Channel to request Promise: send (hop_json, promise_tx)
+    pub middleware_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>)>>,
 }
 
 #[napi(object)]
