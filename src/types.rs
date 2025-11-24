@@ -35,7 +35,7 @@ pub struct ServerTask {
     pub max_hops: u32,
     pub per_ttl: u32,
     pub shutdown_tx: broadcast::Sender<()>,
-    pub middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<String, napi::threadsafe_function::ErrorStrategy::Fatal>>,
+    pub middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<(String, tokio::sync::mpsc::UnboundedSender<String>), napi::threadsafe_function::ErrorStrategy::Fatal>>,
 }
 
 #[napi(object)]

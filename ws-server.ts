@@ -23,9 +23,6 @@ console.log('Port:', WS_PORT);
 console.log('Max hops:', MAX_HOPS);
 console.log('Timeout per TTL:', TIMEOUT_MS, 'ms');
 
-// Store middleware in global scope so Rust can access it via TSFN
-(global as any).__zerotrace_middleware = geoipMiddleware;
-
 // Start WebSocket server with GeoIP middleware
 const wsServer = startServer({
   port: WS_PORT,

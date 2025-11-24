@@ -13,16 +13,17 @@ export interface EnrichedHopEvent extends HopEvent {
  * GeoIP enrichment middleware
  * 
  * @param hopData - Hop data object from traceroute
- * @returns Promise with enriched hop data as JSON string
+ * @param next - Callback function to send enriched data back to Rust
  */
-export async function geoipMiddleware(hopData: HopEvent): Promise<string> {
+export async function geoipMiddleware(hopData: HopEvent, next: (enrichedJson: string) => void): Promise<void> {
   console.log(`[GeoIP Middleware] START - Processing hop data:`, JSON.stringify(hopData));
   
   const ip = hopData.router || hopData.ip;
   
   if (!ip) {
     console.log('[GeoIP Middleware] No IP found, returning original');
-    return JSON.stringify(hopData);
+    next(JSON.stringify(hopData));
+    return;
   }
 
   console.log(`[GeoIP Middleware] Enriching IP: ${ip}`);
@@ -38,6 +39,6 @@ export async function geoipMiddleware(hopData: HopEvent): Promise<string> {
     }
   };
 
-  console.log(`[GeoIP Middleware] Returning enriched data as JSON string`);
-  return JSON.stringify(enriched);
+  console.log(`[GeoIP Middleware] Calling next() with enriched data`);
+  next(JSON.stringify(enriched));
 }
