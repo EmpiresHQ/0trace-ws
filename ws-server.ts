@@ -1,6 +1,6 @@
 import { startServer } from './index.js';
 import type { HopEvent, ClientConnectedEvent, ClientDoneEvent, ErrorEvent } from './types.js';
-import { geoipMiddleware } from './geoip-middleware.js';
+import { geoipMiddleware } from './geoip-middleware.ts';
 
 const WS_PORT = Number(process.env.WS_PORT) || 8080;
 const MAX_HOPS = Number(process.env.MAX_HOPS) || 30;
