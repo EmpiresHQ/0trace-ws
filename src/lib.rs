@@ -31,9 +31,11 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
 
     // Create threadsafe middleware function if provided
     let middleware = if let Some(js_fn) = opts.middleware {
-        Some(js_fn.create_threadsafe_function(
+        eprintln!("[DEBUG lib] Creating middleware ThreadsafeFunction");
+        let tsfn = js_fn.create_threadsafe_function(
             0,
             |ctx: napi::threadsafe_function::ThreadSafeCallContext<types::MiddlewareContext>| {
+                eprintln!("[DEBUG lib] Middleware ThreadsafeFunction called!");
                 let json_data = ctx.value.json_data;
                 let sender = ctx.value.sender;
                 
@@ -46,6 +48,7 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
                 
                 // Create next() callback function that receives object and converts back to JSON
                 let next_fn = ctx.env.create_function_from_closure("next", move |ctx| {
+                    eprintln!("[DEBUG lib] next() callback called from JS!");
                     let enriched_obj: napi::JsUnknown = ctx.get(0)?;
                     // Use JSON.stringify to convert object back to string
                     let global = ctx.env.get_global()?;
@@ -54,8 +57,12 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
                     let json_result_unknown: napi::JsUnknown = json_stringify.call(None, &[enriched_obj])?;
                     let json_result: napi::JsString = json_result_unknown.coerce_to_string()?;
                     let enriched_json = json_result.into_utf8()?.as_str()?.to_string();
+                    eprintln!("[DEBUG lib] next() sending enriched JSON: {}", enriched_json);
                     if let Some(tx) = sender.lock().unwrap().take() {
                         let _ = tx.send(enriched_json);
+                        eprintln!("[DEBUG lib] next() sent through channel");
+                    } else {
+                        eprintln!("[DEBUG lib] next() ERROR: channel already used!");
                     }
                     ctx.env.get_undefined()
                 })?;
@@ -63,8 +70,11 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
                 // Pass [hop_object, next_callback] to middleware
                 Ok(vec![hop_obj, next_fn.into_unknown()])
             },
-        )?)
+        )?;
+        eprintln!("[DEBUG lib] Middleware ThreadsafeFunction created successfully");
+        Some(tsfn)
     } else {
+        eprintln!("[DEBUG lib] No middleware provided");
         None
     };
 

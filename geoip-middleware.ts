@@ -17,11 +17,12 @@ export interface EnrichedHopEvent extends HopEvent {
  */
 export async function geoipMiddleware(hopData: HopEvent, next: (enrichedData: EnrichedHopEvent) => void): Promise<void> {
   try {
-    console.log(`[GeoIP Middleware] Processing hop data...`);
+    console.log(`[GeoIP Middleware] START - Processing hop data:`, JSON.stringify(hopData));
     
     const ip = hopData.router || hopData.ip;
     
     if (!ip) {
+      console.log('[GeoIP Middleware] No IP found, sending original');
       // No IP to enrich, send original data back
       next(hopData);
       return;
@@ -62,11 +63,12 @@ export async function geoipMiddleware(hopData: HopEvent, next: (enrichedData: En
     */
 
     // Send enriched data back via next() callback
-    console.log(`[GeoIP Middleware] Sending enriched data back`);
+    console.log(`[GeoIP Middleware] Calling next() with enriched data`);
     next(enriched);
+    console.log(`[GeoIP Middleware] END - next() called successfully`);
     
   } catch (error) {
-    console.error('[GeoIP Middleware] Error:', error);
+    console.error('[GeoIP Middleware] ERROR:', error);
     // On error, send original data back
     next(hopData);
   }

@@ -382,19 +382,26 @@ pub async fn handle_client(
                                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                             );
                             
-                            // Wait for enriched data from middleware Promise
-                            match rx.await {
-                                Ok(enriched) => {
+                            eprintln!("[DEBUG handler] Middleware called, waiting for response...");
+                            
+                            // Wait for enriched data from middleware Promise with timeout
+                            match tokio::time::timeout(Duration::from_secs(2), rx).await {
+                                Ok(Ok(enriched)) => {
                                     eprintln!("[DEBUG handler] Middleware enriched data received");
                                     let _ = ws_writer.send(Message::Text(enriched)).await;
                                 }
-                                Err(_) => {
+                                Ok(Err(_)) => {
                                     eprintln!("[DEBUG handler] Middleware channel closed, using original");
+                                    let _ = ws_writer.send(Message::Text(json_str)).await;
+                                }
+                                Err(_) => {
+                                    eprintln!("[DEBUG handler] Middleware timeout (2s), using original");
                                     let _ = ws_writer.send(Message::Text(json_str)).await;
                                 }
                             }
                         } else {
                             // No middleware, send original
+                            eprintln!("[DEBUG handler] No middleware, sending original");
                             let json_str = serde_json::to_string(&hop_msg).unwrap();
                             let _ = ws_writer.send(Message::Text(json_str)).await;
                         }
