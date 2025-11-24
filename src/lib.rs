@@ -34,45 +34,11 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
 
     // Convert middleware JsFunction to ThreadsafeFunction if provided
     let middleware_tsfn = if let Some(middleware_fn) = opts.middleware {
-        eprintln!("[DEBUG] Creating ThreadsafeFunction for middleware");
-        Some(middleware_fn.create_threadsafe_function(
-            0,
-            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(String, tokio::sync::mpsc::UnboundedSender<String>)>| {
-                eprintln!("[DEBUG] TSFN callback executing in JS context");
-                let (hop_json, result_tx) = ctx.value;
-                
-                // Parse JSON string to object
-                let global = ctx.env.get_global()?;
-                let json_obj: napi::JsObject = global.get_named_property("JSON")?;
-                let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
-                let json_str = ctx.env.create_string(&hop_json)?;
-                let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
-                
-                // Wrap result_tx in Arc so it can be cloned into the closure
-                let result_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
-                
-                // Create callback function (next) that JS will call with enriched data
-                let next_callback = ctx.env.create_function_from_closure("next", move |ctx| {
-                    eprintln!("[DEBUG] next() callback called from JS");
-                    let enriched_json: String = ctx.get::<napi::JsString>(0)?.into_utf8()?.as_str()?.to_string();
-                    eprintln!("[DEBUG] Sending enriched data back to Rust: {}", &enriched_json[..enriched_json.len().min(50)]);
-                    
-                    // Send enriched data back to Rust
-                    if let Some(tx) = result_tx.lock().unwrap().take() {
-                        let _ = tx.send(enriched_json);
-                    } else {
-                        eprintln!("[DEBUG] next() called multiple times - ignoring");
-                    }
-                    
-                    ctx.env.get_undefined()
-                })?;
-                
-                eprintln!("[DEBUG] Calling JS middleware with hop and next callback");
-                
-                // Return [hopObj, nextCallback] so middleware can be called as: middleware(hopObj, next)
-                Ok(vec![hop_obj, next_callback.into_unknown()])
-            },
-        )?)
+        eprintln!("[DEBUG] Creating async ThreadsafeFunction for middleware");
+        Some(middleware_fn.create_threadsafe_function(0, |ctx| {
+            eprintln!("[DEBUG] TSFN callback - passing hop JSON to middleware");
+            Ok(vec![ctx.value])
+        })?)
     } else {
         eprintln!("[DEBUG] No middleware provided");
         None
@@ -100,7 +66,7 @@ pub(crate) async fn run_server_loop(
     max_hops: u32,
     per_ttl: u32,
     shutdown_tx: broadcast::Sender<()>,
-    middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<(String, tokio::sync::mpsc::UnboundedSender<String>), napi::threadsafe_function::ErrorStrategy::Fatal>>,
+    middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<String, napi::threadsafe_function::ErrorStrategy::Fatal>>,
 ) {
     let addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -119,59 +85,8 @@ pub(crate) async fn run_server_loop(
         &serde_json::json!({"message": format!("listening on {}", addr)}),
     );
 
-    // Create middleware channel if middleware is provided
-    let middleware_channel = if let Some(tsfn) = middleware_tsfn {
-        let (middleware_tx, mut middleware_rx) = tokio::sync::mpsc::unbounded_channel::<(
-            String,
-            tokio::sync::mpsc::UnboundedSender<String>,
-        )>();
-
-        // Spawn task to process middleware requests
-        tokio::spawn(async move {
-            eprintln!("[DEBUG] Middleware handler task started");
-            while let Some((json_str, promise_tx)) = middleware_rx.recv().await {
-                eprintln!("[DEBUG] Middleware request: {}", &json_str[..json_str.len().min(50)]);
-                
-                // Create channel for receiving result from JS
-                let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                
-                // Call TSFN with both the JSON and the result channel
-                let call_status = tsfn.call(
-                    (json_str.clone(), result_tx),
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
-                
-                eprintln!("[DEBUG] TSFN call status: {:?}", call_status);
-                
-                // Wait for result from JS with timeout
-                let promise_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(1000),  // Reduce timeout to 1s
-                    result_rx.recv()
-                ).await;
-                
-                match promise_result {
-                    Ok(Some(enriched_json)) => {
-                        eprintln!("[DEBUG] Got enriched result from JS: {}", &enriched_json[..enriched_json.len().min(50)]);
-                        let _ = promise_tx.send(enriched_json);
-                    }
-                    Ok(None) => {
-                        eprintln!("[DEBUG] Channel closed without result, using fallback");
-                        let _ = promise_tx.send(json_str);
-                    }
-                    Err(_) => {
-                        eprintln!("[DEBUG] Timeout waiting for JS middleware (1s), using fallback");
-                        let _ = promise_tx.send(json_str);
-                    }
-                }
-            }
-            eprintln!("[DEBUG] Middleware handler task stopped");
-        });
-
-        Some(middleware_tx)
-    } else {
-        eprintln!("[DEBUG] No middleware provided");
-        None
-    };
+    // Pass TSFN directly to handle_client (no wrapper channel needed)
+    let middleware_tsfn_option = middleware_tsfn.clone();
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     loop {
@@ -186,12 +101,13 @@ pub(crate) async fn run_server_loop(
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((stream, peer)) => {
+                        let tsfn_clone = middleware_tsfn_option.clone();
                         tokio::spawn(handler::handle_client(
                             stream,
                             peer,
                             max_hops as u8,
                             Duration::from_millis(per_ttl as u64),
-                            middleware_channel.clone(),
+                            tsfn_clone,
                         ));
                     }
                     Err(e) => {

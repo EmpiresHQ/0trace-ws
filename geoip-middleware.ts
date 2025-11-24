@@ -10,25 +10,25 @@ export interface EnrichedHopEvent extends HopEvent {
 }
 
 /**
- * GeoIP enrichment middleware
+ * GeoIP enrichment middleware - returns Promise<string>
  * 
- * @param hopData - Hop data object from traceroute
- * @param next - Callback function to send enriched data back to Rust
+ * @param hopData - Hop data JSON string from traceroute
+ * @returns Promise that resolves to enriched JSON string
  */
-export async function geoipMiddleware(hopData: HopEvent, next: (enrichedJson: string) => void): Promise<void> {
-  console.log(`[GeoIP Middleware] START - Processing hop data:`, JSON.stringify(hopData));
+export async function geoipMiddleware(hopDataJson: string): Promise<string> {
+  console.log(`[GeoIP Middleware] START - Processing hop data:`, hopDataJson.substring(0, 100));
   
+  const hopData: HopEvent = JSON.parse(hopDataJson);
   const ip = hopData.router || hopData.ip;
   
   if (!ip) {
     console.log('[GeoIP Middleware] No IP found, returning original');
-    next(JSON.stringify(hopData));
-    return;
+    return hopDataJson;
   }
 
   console.log(`[GeoIP Middleware] Enriching IP: ${ip}`);
   
-  // Mock enrichment
+  // Mock enrichment (можно добавить реальный async API call)
   const enriched: EnrichedHopEvent = {
     ...hopData,
     geo: {
@@ -39,6 +39,7 @@ export async function geoipMiddleware(hopData: HopEvent, next: (enrichedJson: st
     }
   };
 
-  console.log(`[GeoIP Middleware] Calling next() with enriched data`);
-  next(JSON.stringify(enriched));
+  const result = JSON.stringify(enriched);
+  console.log(`[GeoIP Middleware] Returning enriched data:`, result.substring(0, 100));
+  return result;
 }

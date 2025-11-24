@@ -16,10 +16,7 @@ use tokio_tungstenite::{
     tungstenite::Message,
 };
 
-type MiddlewareChannel = tokio::sync::mpsc::UnboundedSender<(
-    String,
-    tokio::sync::mpsc::UnboundedSender<String>,
-)>;
+type MiddlewareTsfn = napi::threadsafe_function::ThreadsafeFunction<String, napi::threadsafe_function::ErrorStrategy::Fatal>;
 
 /// Handle a single WebSocket client connection and perform 0trace traceroute
 pub async fn handle_client(
@@ -27,7 +24,7 @@ pub async fn handle_client(
     peer_address: SocketAddr,
     max_hops: u8,
     ttl_timeout: Duration,
-    middleware_channel: Option<MiddlewareChannel>,
+    middleware_tsfn: Option<MiddlewareTsfn>,
 ) {
     let client_id = format!("{}", peer_address);
     
@@ -83,7 +80,7 @@ pub async fn handle_client(
         max_hops,
         ttl_timeout,
         websocket_writer,
-        middleware_channel,
+        middleware_tsfn,
         completion_signal_tx,
     ));
     
@@ -209,7 +206,7 @@ async fn run_traceroute(
     max_hops: u8,
     ttl_timeout: Duration,
     websocket_writer: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
-    middleware_channel: Option<MiddlewareChannel>,
+    middleware_tsfn: Option<MiddlewareTsfn>,
     completion_signal: oneshot::Sender<()>,
 ) {
     eprintln!(
@@ -236,7 +233,7 @@ async fn run_traceroute(
     // Task to process hops through middleware
     let middleware_task = spawn_middleware_processor_task(
         hop_queue_rx,
-        middleware_channel,
+        middleware_tsfn,
         websocket_message_tx.clone(),
     );
     
@@ -432,44 +429,38 @@ fn spawn_websocket_writer_task(
 /// Spawn task to process hops through middleware
 fn spawn_middleware_processor_task(
     mut hop_queue: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    middleware_channel: Option<MiddlewareChannel>,
+    middleware_tsfn: Option<MiddlewareTsfn>,
     websocket_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         eprintln!("[DEBUG handler] Middleware processor task started");
         while let Some(hop_message) = hop_queue.recv().await {
             let json_str = serde_json::to_string(&hop_message).unwrap();
-            eprintln!("[DEBUG handler] Processing hop through middleware: {}", &json_str[..json_str.len().min(50)]);
+            eprintln!("[DEBUG handler] Processing hop: {}", &json_str[..json_str.len().min(50)]);
             
-            if let Some(ref middleware_tx) = middleware_channel {
-                eprintln!("[DEBUG handler] Sending to middleware channel");
-                // Request result from middleware
-                let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+            if let Some(ref tsfn) = middleware_tsfn {
+                eprintln!("[DEBUG handler] Calling middleware via TSFN.call_async");
                 
-                if middleware_tx.send((json_str.clone(), result_tx)).is_err() {
-                    eprintln!("[DEBUG handler] Middleware channel closed, using fallback");
-                    let _ = websocket_tx.send(json_str);
-                    continue;
-                }
-                
-                eprintln!("[DEBUG handler] Waiting for middleware result");
-                // Await result in separate task
-                let ws_tx = websocket_tx.clone();
-                let fallback_json = json_str;
-                tokio::spawn(async move {
-                    match result_rx.recv().await {
-                        Some(enriched) => {
-                            eprintln!("[DEBUG handler] Got enriched data from middleware");
-                            let _ = ws_tx.send(enriched);
-                        }
-                        None => {
-                            eprintln!("[DEBUG handler] Middleware timeout/error, using fallback");
-                            let _ = ws_tx.send(fallback_json);
-                        }
+                // Call async and await result with timeout
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(1000),
+                    tsfn.call_async::<String>(json_str.clone())
+                ).await {
+                    Ok(Ok(enriched_json)) => {
+                        eprintln!("[DEBUG handler] Got enriched data: {}", &enriched_json[..enriched_json.len().min(50)]);
+                        let _ = websocket_tx.send(enriched_json);
                     }
-                });
+                    Ok(Err(e)) => {
+                        eprintln!("[DEBUG handler] Middleware error: {:?}, using fallback", e);
+                        let _ = websocket_tx.send(json_str);
+                    }
+                    Err(_) => {
+                        eprintln!("[DEBUG handler] Middleware timeout (1s), using fallback");
+                        let _ = websocket_tx.send(json_str);
+                    }
+                }
             } else {
-                eprintln!("[DEBUG handler] No middleware, sending directly to WebSocket");
+                eprintln!("[DEBUG handler] No middleware, sending directly");
                 let _ = websocket_tx.send(json_str);
             }
         }
