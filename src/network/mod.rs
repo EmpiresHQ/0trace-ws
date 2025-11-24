@@ -1,4 +1,4 @@
-/// Raw socket operations for sending TCP probes and receiving ICMP responses
+//! Raw socket operations for sending TCP probes and receiving ICMP responses
 
 use anyhow::{anyhow, Result};
 use libc::{

@@ -1,4 +1,4 @@
-/// Packet building and checksum calculation utilities
+//! Packet building and checksum calculation utilities
 
 use std::net::Ipv4Addr;
 use crate::constants::*;

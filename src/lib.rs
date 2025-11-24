@@ -32,8 +32,23 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
     let max_hops = opts.max_hops.unwrap_or(constants::DEFAULT_MAX_HOPS);
     let per_ttl = opts.per_ttl_timeout_ms.unwrap_or(constants::DEFAULT_PER_TTL_TIMEOUT_MS);
 
-    // No middleware handling needed here - it's called directly on JS side
-    // and returns Promise<String> which is Send and can be awaited in Rust
+    // Convert middleware JsFunction to ThreadsafeFunction if provided
+    let middleware_tsfn = if let Some(middleware_fn) = opts.middleware {
+        Some(middleware_fn.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<String>| {
+                // Parse JSON string and call middleware with it
+                let global = ctx.env.get_global()?;
+                let json_obj: napi::JsObject = global.get_named_property("JSON")?;
+                let json_parse: napi::JsFunction = json_obj.get_named_property("parse")?;
+                let json_str = ctx.env.create_string(&ctx.value)?;
+                let hop_obj: napi::JsUnknown = json_parse.call(None, &[json_str])?;
+                Ok(vec![hop_obj])
+            },
+        )?)
+    } else {
+        None
+    };
 
     let (shutdown_tx, _) = broadcast::channel::<()>(8);
     let server_task = types::ServerTask {
@@ -42,6 +57,7 @@ pub fn start_server(opts: ServerOptions) -> napi::Result<Server> {
         max_hops,
         per_ttl,
         shutdown_tx: shutdown_tx.clone(),
+        middleware_tsfn,
     };
 
     Ok(Server { 
@@ -56,6 +72,7 @@ pub(crate) async fn run_server_loop(
     max_hops: u32,
     per_ttl: u32,
     shutdown_tx: broadcast::Sender<()>,
+    middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<String, napi::threadsafe_function::ErrorStrategy::Fatal>>,
 ) {
     let addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -73,6 +90,35 @@ pub(crate) async fn run_server_loop(
         "clientConnected",
         &serde_json::json!({"message": format!("listening on {}", addr)}),
     );
+
+    // Create middleware channel if middleware is provided
+    let middleware_channel = if let Some(tsfn) = middleware_tsfn {
+        let (middleware_tx, mut middleware_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            String,
+            tokio::sync::mpsc::UnboundedSender<napi::bindgen_prelude::Promise<String>>,
+        )>();
+
+        // Spawn task to process middleware requests
+        tokio::spawn(async move {
+            while let Some((json_str, promise_tx)) = middleware_rx.recv().await {
+                let tsfn_clone = tsfn.clone();
+                let json_clone = json_str.clone();
+                
+                // Call JS middleware and get Promise<String>
+                let promise_result = tsfn_clone.call_async::<napi::bindgen_prelude::Promise<String>>(
+                    json_clone
+                ).await;
+
+                if let Ok(promise) = promise_result {
+                    let _ = promise_tx.send(promise);
+                }
+            }
+        });
+
+        Some(middleware_tx)
+    } else {
+        None
+    };
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     loop {
@@ -92,7 +138,7 @@ pub(crate) async fn run_server_loop(
                             peer,
                             max_hops as u8,
                             Duration::from_millis(per_ttl as u64),
-                            None, // No middleware channel needed
+                            middleware_channel.clone(),
                         ));
                     }
                     Err(e) => {
@@ -138,6 +184,7 @@ mod tests {
             max_hops: None,
             per_ttl_timeout_ms: None,
             iface_hint: None,
+            middleware: None,
         };
 
         let host = opts.host.unwrap_or_else(|| "0.0.0.0".into());

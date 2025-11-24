@@ -1,4 +1,4 @@
-/// WebSocket client handler for 0trace traceroute
+//! WebSocket client handler for 0trace traceroute
 
 use crate::connection::{extract_connection_params, extract_real_client_ip};
 use crate::constants::*;

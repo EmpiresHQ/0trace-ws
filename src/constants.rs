@@ -1,4 +1,4 @@
-/// Network protocol and packet constants
+//! Network protocol and packet constants
 
 // ICMP protocol constants
 pub const ICMP_TIME_EXCEEDED: u8 = 11;

@@ -1,4 +1,4 @@
-/// WebSocket connection utilities for extracting real client IP and connection parameters
+//! WebSocket connection utilities for extracting real client IP and connection parameters
 
 use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, SocketAddr};

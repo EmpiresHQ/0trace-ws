@@ -1,4 +1,4 @@
-/// ICMP packet parsing and analysis
+//! ICMP packet parsing and analysis
 
 use std::net::Ipv4Addr;
 use crate::constants::*;

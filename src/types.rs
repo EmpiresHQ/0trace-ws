@@ -35,6 +35,7 @@ pub struct ServerTask {
     pub max_hops: u32,
     pub per_ttl: u32,
     pub shutdown_tx: broadcast::Sender<()>,
+    pub middleware_tsfn: Option<napi::threadsafe_function::ThreadsafeFunction<String, napi::threadsafe_function::ErrorStrategy::Fatal>>,
 }
 
 #[napi(object)]
@@ -44,8 +45,7 @@ pub struct ServerOptions {
     pub max_hops: Option<u32>,
     pub per_ttl_timeout_ms: Option<u32>,
     pub iface_hint: Option<String>,
-    // Middleware is called on JS side and returns Promise<String>
-    // We don't need to store the function itself
+    pub middleware: Option<napi::JsFunction>,
 }
 
 #[napi]
@@ -79,6 +79,7 @@ impl Server {
             task.max_hops,
             task.per_ttl,
             task.shutdown_tx,
+            task.middleware_tsfn,
         ));
 
         Ok(())
