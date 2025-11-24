@@ -265,18 +265,14 @@ pub async fn handle_client(
                         
                         eprintln!("[DEBUG handler] Middleware called, waiting for response...");
                         
-                        // Wait for enriched data from middleware Promise with timeout
-                        match tokio::time::timeout(Duration::from_secs(2), rx).await {
-                            Ok(Ok(enriched)) => {
+                        // Wait for enriched data from middleware Promise
+                        match rx.await {
+                            Ok(enriched) => {
                                 eprintln!("[DEBUG handler] Middleware enriched data received");
                                 let _ = ws_writer_clone.send(Message::Text(enriched)).await;
                             }
-                            Ok(Err(_)) => {
-                                eprintln!("[DEBUG handler] Middleware channel closed, using original");
-                                let _ = ws_writer_clone.send(Message::Text(json_str)).await;
-                            }
                             Err(_) => {
-                                eprintln!("[DEBUG handler] Middleware timeout (2s), using original");
+                                eprintln!("[DEBUG handler] Middleware channel closed, using original");
                                 let _ = ws_writer_clone.send(Message::Text(json_str)).await;
                             }
                         }
