@@ -8,13 +8,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const HTTP_PORT = Number(process.env.HTTP_PORT) || 3000;
 
-const publicPath = path.join(__dirname, 'public');
 console.log('Starting HTTP server...');
-console.log('Serving static files from:', publicPath);
 console.log('Port:', HTTP_PORT);
 
-// Serve static files from 'public' directory
-app.use(express.static(publicPath));
+// Serve static files from dist directory
+app.use(express.static(path.join(__dirname, 'dist')));
 
 // Health check endpoint
 app.get('/health', (req, res) => {

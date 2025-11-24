@@ -5,20 +5,28 @@
   "main": "index.js",
   "scripts": {
     "build": "napi build --release",
+    "build:frontend": "vite build",
     "dev": "napi build --debug",
     "start:http": "node --experimental-strip-types http-server.ts",
-    "start:ws": "node --experimental-strip-types ws-server.ts"
+    "start:ws": "node --experimental-strip-types ws-server.ts",
+    "prebuild:frontend": "mkdir -p dist"
   },
   "dependencies": {
+    "autoprefixer": "^10.4.22",
     "express": "^5.1.0",
     "node-addon-api": "^7.0.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.17",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
+    "@tailwindcss/vite": "^4.1.17",
     "@types/express": "^5.0.5",
     "@types/node": "^24.10.1",
-    "@types/ws": "^8.18.1"
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "vite": "^7.2.4"
   },
   "engines": {
     "node": ">=24"

@@ -56,6 +56,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+          build-args: |
+            WS_URL=${{ secrets.WS_URL || 'ws://localhost:8080' }}
 
       - name: Deploy to server
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'

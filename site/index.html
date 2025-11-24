@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>0trace</title>
+  </head>
+  <body class="bg-gray-950 text-gray-100 min-h-screen p-4">
+    <div class="max-w-4xl mx-auto space-y-4">
+      <!-- Header -->
+      <header class="text-center py-8">
+        <h1 class="text-4xl font-bold mb-1">0trace</h1>
+        <p class="text-gray-400 text-sm">network tracer</p>
+      </header>
+
+      <!-- Status Bar -->
+      <div class="bg-gray-900 border border-gray-800 rounded p-3 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div id="status-indicator" class="w-2 h-2 rounded-full bg-gray-500"></div>
+          <span id="status-text" class="text-sm text-gray-400">connecting</span>
+        </div>
+        <div class="text-xs text-gray-600 font-mono" id="ws-host"></div>
+      </div>
+
+      <!-- Output -->
+      <div 
+        id="output" 
+        class="bg-gray-900 border border-gray-800 rounded p-4 h-[600px] overflow-y-auto font-mono text-sm"
+      >
+        <div class="text-gray-600">waiting for data...</div>
+      </div>
+    </div>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

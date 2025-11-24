@@ -1,6 +1,10 @@
 # Multi-stage build for zerotrace-ws
 FROM node:24-alpine AS builder
 
+# Build arguments
+ARG WS_URL=ws://localhost:8080
+ENV WS_URL=${WS_URL}
+
 # Install build dependencies
 RUN apk add --no-cache \
     curl \
@@ -28,12 +32,16 @@ RUN npm ci
 
 # Copy source code
 COPY src ./src
+COPY site ./site
 COPY *.ts ./
 COPY index.js ./
-COPY public ./public
+COPY vite.config.ts ./
 
 # Build Rust native module
 RUN npm run build
+
+# Build frontend with WS_PORT
+RUN npm run build:frontend
 
 # Production stage
 FROM node:24-alpine
@@ -50,7 +58,7 @@ COPY --from=builder /app/index.node ./
 COPY --from=builder /app/index.js ./
 COPY --from=builder /app/index.d.ts ./
 COPY --from=builder /app/*.ts ./
-COPY --from=builder /app/public ./public
+COPY --from=builder /app/dist ./dist
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
